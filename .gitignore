@@ -11,29 +11,7 @@ venv/
 env/
 .venv/
 
-# Data files (nặng) — nếu bạn lưu data lớn bên ngoài repository
-/data/low_res/*
-//data/high_res/*
-//data/samples/*
 
-# Model / pretrained files nếu có
-/models/
-*.h5
-*.pth
-*.pt
-*.pb
-*.ckpt
-
-# Output / generated files
-/output/
-*.png
-*.jpg
-*.jpeg
-*.pdf
-*.svg
-
-# Logs
-*.log
 
 # IDEs / editors
 .vscode/
