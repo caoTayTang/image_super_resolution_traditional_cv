@@ -21,4 +21,5 @@ def sr_interpolation(img: Image.Image, method='nearest', scale=2) -> Image.Image
     
     h, w = img.shape[:2]
     out = cv2.resize(img, (w * scale, h * scale), interpolation=inter)
-    return Image.fromarray(out)
+    return out
+    # return Image.fromarray(out)
