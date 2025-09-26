@@ -1,3 +1,4 @@
-# from .interpolation import bicubic
+from .degradation import degrade_image
+from .demo import run_gradio
 
-# __all__ = ['']
+__all__ = ['degrade_image', 'run_gradio']
