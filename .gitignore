@@ -46,4 +46,4 @@ env/
 Thumbs.db
 
 #data files
-data/
+*.npy
