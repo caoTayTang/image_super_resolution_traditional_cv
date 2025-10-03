@@ -1,6 +1,12 @@
-numpy
+numpy>=1.21.0
 gradio
 pillow
 matplotlib
-opencv-python
+opencv-python>=4.5.0
 scipy
+scikit-image>=0.18.0
+
+# Optional for LPIPS perceptual metric
+# torch>=1.9.0
+# torchvision>=0.10.0
+# lpips>=0.1.4

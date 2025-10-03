@@ -11,6 +11,9 @@ venv/
 env/
 .venv/
 
+# Test file
+test.py
+
 
 
 # IDEs / editors

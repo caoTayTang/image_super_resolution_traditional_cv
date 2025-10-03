@@ -32,11 +32,19 @@ def degrade_image(hr, scale=4, kernel=None, noise_type="gaussian", noise_std=0.0
     if kernel is None:
         kernel = gaussian_kernel(9, 1.6)
 
-    # Blur
-    hr_blur = signal.convolve2d(hr, kernel, mode="same", boundary="symm")
-
-    # Downsample
-    lr = hr_blur[::scale, ::scale]
+    # Handle both grayscale and color images
+    if hr.ndim == 2:  # Grayscale image
+        # Blur
+        hr_blur = signal.convolve2d(hr, kernel, mode="same", boundary="symm")
+        # Downsample
+        lr = hr_blur[::scale, ::scale]
+    else:  # Color image (3D)
+        hr_blur = np.zeros_like(hr)
+        # Apply blur to each channel separately
+        for c in range(hr.shape[2]):
+            hr_blur[:, :, c] = signal.convolve2d(hr[:, :, c], kernel, mode="same", boundary="symm")
+        # Downsample
+        lr = hr_blur[::scale, ::scale, :]
 
     # Add noise
     if noise_type == "gaussian":
