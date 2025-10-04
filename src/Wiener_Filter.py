@@ -13,6 +13,7 @@ import numpy as np
 import cv2
 from scipy.signal import wiener as adaptive_wiener
 from numpy.fft import fft2, ifft2, ifftshift
+from scipy.fft import fft2, ifft2, fftfreq, fftshift
 from skimage import img_as_float, color
 from skimage.restoration import (
     unsupervised_wiener,
@@ -20,261 +21,200 @@ from skimage.restoration import (
     denoise_tv_chambolle,
     estimate_sigma as skimage_estimate_sigma,
 )
-from skimage.util import img_as_ubyte
+from scipy.ndimage import gaussian_filter
 
+def unsupervised_wiener_custom(image, psf_init=None, iterations=10, clip=True, balance=0.1):
+    """
+    Tái hiện hàm restoration.unsupervised_wiener của scikit-image.
+    Input:
+        image: Ảnh grayscale (2D array, float [0,1] hoặc [0,255])
+        psf_init: Kernel khởi tạo (2D array, nếu None thì dùng Gaussian 5x5)
+        iterations: Số lần lặp để tinh chỉnh kernel
+        clip: Có clip ảnh khôi phục về [0,1] không
+        balance: Tham số regularization (tương tự K trong Wiener filter)
+    Output:
+        deconvolved: Ảnh khôi phục
+        psf: Kernel ước lượng
+    """
+    # Chuẩn hóa ảnh
+    img = np.asarray(image, dtype=float)
+    if img.max() > 1.0:
+        img = img / 255.0  # Giả sử ảnh [0,255] nếu không chuẩn hóa
 
-def _to_luminance(img):
-    """Return (luma, is_color) where luma is 2D float image [0..1]."""
-    img_f = img_as_float(img)
-    if img_f.ndim == 3 and img_f.shape[2] == 3:
-        return color.rgb2ycbcr(img_f)[..., 0], True
-    elif img_f.ndim == 3 and img_f.shape[2] == 4:
-        img_rgb = img_f[..., :3]
-        return color.rgb2ycbcr(img_rgb)[..., 0], True
+    # Khởi tạo kernel nếu không cung cấp
+    if psf_init is None:
+        psf = np.ones((5, 5)) / 25  # Kernel Gaussian nhỏ
+        psf = gaussian_filter(psf, sigma=1)
+        psf /= psf.sum()
     else:
-        return img_f, False
+        psf = np.asarray(psf_init, dtype=float)
+        psf /= psf.sum()
+
+    # Wiener filter cơ bản
+    def wiener_step(img, kernel, K):
+        kernel = kernel / np.sum(kernel)
+        dummy = np.copy(img)
+        dummy = fft2(dummy)
+        kernel = fft2(kernel, s=img.shape)
+        kernel = np.conj(kernel) / (np.abs(kernel)**2 + K)
+        dummy = dummy * kernel
+        dummy = np.abs(ifft2(dummy))
+        return dummy
+
+    # Lặp để tinh chỉnh kernel
+    deconvolved = np.copy(img)
+    for _ in range(iterations):
+        # Bước 1: Khôi phục ảnh với kernel hiện tại
+        deconvolved = wiener_step(img, psf, balance)
+        if clip:
+            deconvolved = np.clip(deconvolved, 0, 1)
+
+        # Bước 2: Ước lượng kernel mới
+        # Dùng cross-correlation giữa ảnh gốc và ảnh khôi phục
+        psf_new = np.real(ifft2(fft2(img) * np.conj(fft2(deconvolved))))
+        psf_new = np.clip(psf_new, 0, None)  # Giữ positive
+        psf_new = psf_new[0:psf.shape[0], 0:psf.shape[1]]  # Cắt về kích thước ban đầu
+        psf_new /= psf_new.sum() + 1e-6  # Normalize
+
+        # Cập nhật kernel (tránh dao động lớn)
+        psf = 0.5 * psf + 0.5 * psf_new
+
+    # Wiener filter cuối cùng với kernel tối ưu
+    deconvolved = wiener_step(img, psf, balance)
+    if clip:
+        deconvolved = np.clip(deconvolved, 0, 1)
+
+    return deconvolved, psf
 
 
-def _from_luminance(luma, original_img):
-    """If original_img was color, replace Y channel and convert back to RGB; else return luma."""
-    if original_img.ndim == 3 and original_img.shape[2] >= 3:
-        img_f = img_as_float(original_img)
-        ycbcr = color.rgb2ycbcr(img_f)
-        ycbcr[..., 0] = np.clip(luma, 0, 1)
-        rgb = color.ycbcr2rgb(ycbcr)
-        if original_img.shape[2] == 4:
-            alpha = img_f[..., 3]
-            rgba = np.dstack([rgb, alpha])
-            return np.clip(rgba, 0, 1)
-        return np.clip(rgb, 0, 1)
-    else:
-        return np.clip(luma, 0, 1)
-
-
-def estimate_noise_variance(image, method='robust'):
+def unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None, clip=True, rng=None):
     """
-    Estimate noise variance from image (robust Laplacian-based).
-    Returns float variance.
+    Improved unsupervised Wiener filter for grayscale or RGB images using Gibbs sampler.
+    Fixes quadrant swap and 180-degree flip issues by centering PSF and correct meshgrid indexing.
+    Input:
+        image: Grayscale (2D) or RGB (3D) float array [0,1]
+        psf_init: Initial sigma for Gaussian PSF (float)
+        reg: Regularization transfer function (ndarray, optional; default Laplacian)
+        user_params: Dict with 'threshold' (1e-4), 'burnin' (15), 'min_num_iter' (30), 'max_num_iter' (200)
+        clip: Clip output to [0,1]
+        rng: np.random.Generator (optional)
+    Output:
+        deconvolved: Restored image (same shape as input)
+        psf: Estimated PSF (2D array)
     """
-    if method == 'robust':
-        if image.ndim == 2:
-            lap = cv2.Laplacian((image * 255).astype(np.float64), cv2.CV_64F)
-            sigma = np.sqrt(2) * np.median(np.abs(lap - np.median(lap))) / 0.6745
-        else:
-            sigma = 0.0
-            for c in range(image.shape[2]):
-                lap = cv2.Laplacian((image[..., c] * 255).astype(np.float64), cv2.CV_64F)
-                sigma += np.sqrt(2) * np.median(np.abs(lap - np.median(lap))) / 0.6745
-            sigma /= image.shape[2]
-    else:
-        sigma = np.std(image)
-    variance = max(sigma**2, 1e-12)
-    return variance
+    # Defaults
+    if user_params is None:
+        user_params = {'threshold': 1e-4, 'burnin': 15, 'min_num_iter': 30, 'max_num_iter': 200}
+    if rng is None:
+        rng = np.random.default_rng()
 
+    # Check if image is RGB (3D) or grayscale (2D)
+    image = np.asarray(image, dtype=float)
+    is_rgb = len(image.shape) == 3 and image.shape[-1] == 3
+    if is_rgb:
+        restored_img = np.zeros_like(image)
+        psf_final = None
+        for c in range(3):
+            restored_img[..., c], psf = unsupervised_wiener_improved(
+                image[..., c], psf_init, reg, user_params, clip, rng
+            )
+            if c == 0:  # Store PSF from first channel (assume same for all)
+                psf_final = psf
+        return restored_img, psf_final
 
-def _match_shape_to_original(restored, original_img):
-    """
-    Ensure restored has exactly the same shape as original_img.
-    - resized using cv2.resize if necessary
-    - preserves number of channels where possible, re-attaches alpha if needed
-    - input/outputs are floats in [0,1]
-    """
-    orig_shape = original_img.shape
-    if restored.shape == orig_shape:
-        return restored
+    # Normalize image to [0,1]
+    if image.max() > 1.0:
+        image /= 255.0
 
-    # Target size (width, height) for cv2.resize
-    target_h, target_w = orig_shape[0], orig_shape[1]
+    # Shapes
+    shape = image.shape
+    N = shape[0] * shape[1]
 
-    # If restored is grayscale (2D) but original is color, expand channels after resize
-    if restored.ndim == 2:
-        resized = cv2.resize(restored.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-        if len(orig_shape) == 3:
-            # expand to same number of channels as original
-            channels = orig_shape[2]
-            if channels == 1:
-                resized = resized[..., np.newaxis]
-            else:
-                resized = np.stack([resized] * channels, axis=-1)
-    else:
-        # restored has channels
-        resized = cv2.resize(restored.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-        # handle channel count mismatch (e.g., restored=3ch but orig=4ch)
-        if len(orig_shape) == 2 and resized.ndim == 3:
-            # original grayscale but restored color -> convert to gray
-            resized = color.rgb2gray(resized)
-        elif len(orig_shape) == 3:
-            orig_ch = orig_shape[2]
-            res_ch = resized.shape[2]
-            if res_ch != orig_ch:
-                # if original has alpha and restored doesn't, re-attach original alpha
-                if orig_ch == 4 and res_ch == 3:
-                    alpha = img_as_float(original_img)[..., 3]
-                    resized = np.dstack([resized, alpha])
-                elif orig_ch == 3 and res_ch == 4:
-                    # drop alpha
-                    resized = resized[..., :3]
-                else:
-                    # generic fallback: either repeat or truncate channels
-                    if res_ch < orig_ch:
-                        resized = np.concatenate([resized] + [resized[..., -1:]] * (orig_ch - res_ch), axis=2)
-                    else:
-                        resized = resized[..., :orig_ch]
+    # Fourier grid for Laplacian regularization
+    if reg is None:
+        fx = fftfreq(shape[0])
+        fy = fftfreq(shape[1])
+        FX, FY = np.meshgrid(fx, fy)  # Correct order: x, y
+        reg = 2 * (2 - np.cos(2 * np.pi * FX) - np.cos(2 * np.pi * FY))
 
-    resized = np.clip(resized, 0, 1)
-    return resized
+    # Generate Gaussian PSF with correct centering
+    def get_psf_sigma(sigma, shape):
+        x = np.arange(-shape[0]//2, shape[0]//2)
+        y = np.arange(-shape[1]//2, shape[1]//2)
+        X, Y = np.meshgrid(x, y)  # Correct order: x, y
+        psf = np.exp(-(X**2 + Y**2) / (2 * sigma**2))
+        psf /= psf.sum()
+        return fftshift(psf)  # Center the PSF
 
+    psf = get_psf_sigma(psf_init, shape)
+    Lambda_H = fft2(psf)  # PSF transfer function
 
-def restore_image(degraded_lr, scale=4, kernel_size=9, sigma=1.6, noise_var=None):
-    """
-    Simple restore image using upsampling + light denoising (for quick tests).
-    Ensures output shape matches input upsampled shape (but test.py expects restored vs original:
-    so caller should compare original <-> restored after resizing original to match if needed).
-    """
-    degraded = img_as_float(degraded_lr)
-    try:
-        # create simple gaussian PSF (for reference; not used in this simple pipeline)
-        ax = np.linspace(-(kernel_size // 2), kernel_size // 2, kernel_size)
-        xx, yy = np.meshgrid(ax, ax)
-        psf = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
-        psf = psf / (psf.sum() + 1e-12)
+    # Initial values
+    gamma_eps = N / np.linalg.norm(fft2(image))**2
+    gamma_1 = 1.0
+    sigma_psf = psf_init
+    ft_img = fft2(image)
+    ft_x = np.copy(ft_img)
 
-        # Upsample with bicubic
-        if degraded.ndim == 2:
-            h, w = degraded.shape
-            upsampled = cv2.resize(degraded, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-            # simple smoothing
-            restored = cv2.GaussianBlur(upsampled, (3, 3), 0.5)
-            restored = np.clip(restored, 0, 1)
-        else:
-            h, w, c = degraded.shape
-            upsampled = cv2.resize(degraded, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-            restored = np.zeros_like(upsampled)
-            for ch in range(c):
-                restored[..., ch] = cv2.GaussianBlur(upsampled[..., ch], (3, 3), 0.5)
-            restored = np.clip(restored, 0, 1)
+    # Gibbs sampling
+    x_samples = []
+    prev_mean = np.zeros(shape, dtype=complex)
+    k = 0
+    converged = False
+    while not converged and k < user_params['max_num_iter']:
+        # Step 1: Sample image circ x^(k+1)
+        abs_Lambda_H_sq = np.abs(Lambda_H)**2
+        Sigma_inv = gamma_eps * abs_Lambda_H_sq + gamma_1 * reg
+        Sigma = 1 / (Sigma_inv + 1e-10)
+        mu = gamma_eps * Sigma * np.conj(Lambda_H) * ft_img
+        eta_real = rng.normal(0, 1, shape)
+        eta_imag = rng.normal(0, 1, shape)
+        eta = eta_real + 1j * eta_imag
+        ft_x = mu + np.sqrt(Sigma) * eta / np.sqrt(2)
 
-        # This function returns the upsampled restored image (shape determined by degraded and scale)
-        # If you want to guarantee shape equals a specific original (before degradation), caller should pass that original.
-        return restored
+        # Step 2: Sample gamma_eps
+        residual = ft_img - Lambda_H * ft_x
+        beta_eps = np.linalg.norm(residual)**2 / 2
+        alpha_eps = N / 2
+        gamma_eps = rng.gamma(alpha_eps, 1 / beta_eps) if beta_eps > 0 else 1e-6
 
-    except Exception as e:
-        # fallback: return upscaled without filtering
-        if degraded.ndim == 2:
-            h, w = degraded.shape
-            return cv2.resize(degraded, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-        else:
-            h, w, c = degraded.shape
-            return cv2.resize(degraded, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+        # Step 3: Sample gamma_1
+        dx = reg * np.abs(ft_x)**2
+        beta_1 = np.sum(dx) / 2
+        alpha_1 = (N - 1) / 2
+        gamma_1 = rng.gamma(alpha_1, 1 / beta_1) if beta_1 > 0 else 1e-6
 
+        # Step 4: Sample PSF sigma via Metropolis-Hastings
+        sigma_p = 0.1 + rng.random() * 9.9
+        psf_p = get_psf_sigma(sigma_p, shape)
+        Lambda_H_p = fft2(psf_p)
+        resid_old = ft_img - Lambda_H * ft_x
+        resid_p = ft_img - Lambda_H_p * ft_x
+        J = (gamma_eps / 2) * (np.linalg.norm(resid_old)**2 - np.linalg.norm(resid_p)**2)
+        if np.log(rng.random()) < min(J, 0):
+            sigma_psf = sigma_p
+            Lambda_H = Lambda_H_p
 
-def restore_image_advanced(img,
-                           psf=None,
-                           pre_denoise='nl_means',
-                           nl_patch_size=7,
-                           nl_patch_distance=11,
-                           nl_h_factor=0.8,
-                           use_unsupervised_wiener=True,
-                           wiener_K=None,
-                           rl_iters=10,
-                           tv_weight=0.01,
-                           final_adaptive_wiener=False,
-                           return_psf=False):
-    """
-    Advanced restore function: pre-denoise -> (unsupervised) wiener -> optional RL -> TV -> final Wiener
-    Returns restored image (and psf if return_psf=True).
-    This version GUARANTEES the returned restored has the same shape as the input img.
-    """
-    img_in = img
-    luma, was_color = _to_luminance(img_in)
+        # Collect samples
+        k += 1
+        if k > user_params['burnin']:
+            x_samples.append(ft_x)
+            if len(x_samples) >= user_params['min_num_iter']:
+                current_mean = np.mean(x_samples, axis=0)
+                rel_change = np.linalg.norm(current_mean - prev_mean) / np.linalg.norm(current_mean)
+                if rel_change < user_params['threshold']:
+                    converged = True
+                prev_mean = current_mean
 
-    # estimate noise using skimage helper
-    try:
-        sigma_est = skimage_estimate_sigma(luma, multichannel=False)
-    except Exception:
-        sigma_est = np.std(luma)
-    sigma2 = float(max(sigma_est**2, 1e-12))
+    # Final deconvolved
+    if not x_samples:
+        x_samples = [ft_x]
+    ft_mean = np.mean(x_samples, axis=0)
+    deconvolved = np.real(ifft2(ft_mean))
+    if clip:
+        deconvolved = np.clip(deconvolved, 0, 1)
 
-    # pre-denoise
-    luma_proc = luma.copy()
-    if pre_denoise == 'adaptive':
-        luma_proc = adaptive_wiener(luma_proc, mysize=(5, 5))
-    elif pre_denoise == 'nl_means':
-        try:
-            from skimage.restoration import denoise_nl_means
-            sigma_est_local = max(sigma_est, 1e-6)
-            patch_kw = dict(patch_size=nl_patch_size,
-                            patch_distance=nl_patch_distance,
-                            multichannel=False)
-            h = nl_h_factor * sigma_est_local
-            luma_proc = denoise_nl_means(luma_proc, h=h, fast_mode=True, **patch_kw)
-        except Exception:
-            luma_proc = adaptive_wiener(luma_proc, mysize=(5, 5))
+    # Estimated PSF
+    estimated_psf = get_psf_sigma(sigma_psf, shape)
 
-    # deblurring step
-    psf_used = None
-    if psf is None and use_unsupervised_wiener:
-        init_psf = np.zeros((5, 5), dtype=float)
-        init_psf[2, 2] = 1.0
-        try:
-            deconv, psf_est = unsupervised_wiener(luma_proc, init_psf)
-            psf_used = psf_est
-            luma_deblur = np.clip(deconv, 0, 1)
-        except Exception:
-            luma_deblur = luma_proc.copy()
-    else:
-        if psf is None:
-            luma_deblur = luma_proc.copy()
-        else:
-            psf_arr = np.asarray(psf, dtype=float)
-            psf_arr = psf_arr / (psf_arr.sum() + 1e-12)
-            psf_used = psf_arr.copy()
-
-            # Important: use s=img_shape everywhere so FFT sizes are consistent
-            img_shape = luma_proc.shape
-            H = fft2(ifftshift(psf_arr), s=img_shape)
-            G = fft2(luma_proc, s=img_shape)
-            H_conj = np.conj(H)
-            H_abs2 = np.abs(H) ** 2
-
-            if wiener_K is None:
-                signal_power = max(np.var(luma_proc) - sigma2, 1e-12)
-                K = sigma2 / signal_power if signal_power > 0 else 1e-3
-            else:
-                K = float(wiener_K)
-
-            W = H_conj / (H_abs2 + K + 1e-12)
-            F_hat = W * G
-            luma_deblur = np.clip(np.real(ifft2(F_hat, s=img_shape)), 0, 1)
-
-    # Richardson-Lucy refinement
-    if rl_iters and rl_iters > 0 and psf_used is not None:
-        try:
-            psf_norm = psf_used / (psf_used.sum() + 1e-12)
-            luma_deblur = richardson_lucy(luma_deblur, psf_norm, iterations=rl_iters, clip=True)
-        except Exception:
-            pass
-
-    # TV denoise to reduce ringing
-    if tv_weight and tv_weight > 0:
-        try:
-            luma_deblur = denoise_tv_chambolle(luma_deblur, weight=tv_weight, multichannel=False)
-        except Exception:
-            pass
-
-    # final adaptive wiener
-    if final_adaptive_wiener:
-        try:
-            luma_deblur = adaptive_wiener(luma_deblur, mysize=(3, 3))
-        except Exception:
-            pass
-
-    # Convert back to color (or keep grayscale)
-    restored = _from_luminance(luma_deblur, img_in)
-
-    # === NEW: ensure shape exactly matches input img ===
-    restored = _match_shape_to_original(restored, img_in)
-
-    if return_psf:
-        return restored, psf_used
-    return restored
+    return deconvolved, estimated_psf

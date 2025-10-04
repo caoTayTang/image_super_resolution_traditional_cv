@@ -62,38 +62,3 @@ def compute_basic_metrics(img1, img2, multichannel=True):
         metrics['SSIM'] = 0.0
     
     return metrics
-
-def compute_lpips(img1, img2):
-    """
-    Compute LPIPS metric (requires lpips library)
-    """
-    try:
-        import lpips
-        import torch
-        
-        # Initialize LPIPS model
-        loss_fn = lpips.LPIPS(net='alex')
-        
-        # Convert to tensor and proper format
-        # LPIPS expects tensors in [-1, 1] range with shape (N, C, H, W)
-        def to_tensor(img):
-            if img.ndim == 3:
-                img = img.transpose(2, 0, 1)  # HWC to CHW
-            img = torch.from_numpy(img).float()
-            img = img.unsqueeze(0)  # Add batch dimension
-            img = img * 2.0 - 1.0  # [0,1] to [-1,1]
-            return img
-        
-        tensor1 = to_tensor(img1)
-        tensor2 = to_tensor(img2)
-        
-        # Compute LPIPS
-        with torch.no_grad():
-            distance = loss_fn(tensor1, tensor2)
-        
-        return distance.item()
-        
-    except ImportError:
-        raise ImportError("LPIPS requires: pip install lpips")
-    except Exception as e:
-        raise RuntimeError(f"LPIPS computation failed: {e}")
