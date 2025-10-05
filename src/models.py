@@ -1,4 +1,10 @@
-def iterative_backprojection_tv(lr, scale, kernel, iterations=20, alpha=1.0, tv_weight=0.05):
+import numpy as np
+from scipy import signal
+from modules.downsample import blur, simulate_lr_from_hr
+from modules.degradation import gaussian_kernel
+from modules.upsample import upsample_nearest
+
+def iterative_backprojection(lr, upsample=upsample_nearest, scale=4, iterations=20, alpha=1.0, size=9, sigma=1.6):
     """
     Iterative Back-Projection + Total Variation Denoising
     - lr: ảnh LR
@@ -10,9 +16,10 @@ def iterative_backprojection_tv(lr, scale, kernel, iterations=20, alpha=1.0, tv_
     """
     target_h = lr.shape[0] * scale
     target_w = lr.shape[1] * scale
+    
+    kernel = gaussian_kernel(size, sigma)
 
-    # Khởi tạo bằng Bicubic upsampling
-    x = upsample_bicubic(lr, scale, output_shape=(target_h, target_w))
+    x = upsample(lr, scale)
 
     for it in range(iterations):
         # Sinh LR giả lập
@@ -20,14 +27,13 @@ def iterative_backprojection_tv(lr, scale, kernel, iterations=20, alpha=1.0, tv_
         # Sai số ở LR
         err_lr = lr - sim_lr
         # Upsample sai số về HR
-        err_up = upsample_bicubic(err_lr, scale, output_shape=(target_h, target_w))
+        err_up = upsample(err_lr, scale)
         # Back-projection
         flipped_kernel = np.flipud(np.fliplr(kernel))
-        backproj = signal.convolve2d(err_up, flipped_kernel, mode='same', boundary='symm')
+        backproj = blur(err_up, flipped_kernel)
+        # backproj = signal.convolve2d(err_up, flipped_kernel, mode='same', boundary='symm')
         # Cập nhật ảnh
         x = x + alpha * backproj
         x = np.clip(x, 0, 1)
-        # TV denoise
-        x = denoise_tv_chambolle(x, weight=tv_weight, channel_axis=None)
 
     return x
