@@ -15,6 +15,7 @@ from scipy.signal import wiener as adaptive_wiener
 from numpy.fft import fft2, ifft2, ifftshift
 from scipy.fft import fft2, ifft2, fftfreq, fftshift
 from skimage import img_as_float, color
+from skimage.transform import resize
 from skimage.restoration import (
     unsupervised_wiener,
     richardson_lucy,
@@ -22,6 +23,9 @@ from skimage.restoration import (
     estimate_sigma as skimage_estimate_sigma,
 )
 from scipy.ndimage import gaussian_filter
+from src.models import iterative_backprojection_tv
+
+
 
 def unsupervised_wiener_custom(image, psf_init=None, iterations=10, clip=True, balance=0.1):
     """
@@ -218,3 +222,100 @@ def unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None
     estimated_psf = get_psf_sigma(sigma_psf, shape)
 
     return deconvolved, estimated_psf
+
+
+# Assuming the following functions are defined elsewhere:
+# - iterative_backprojection_tv(lr, scale, kernel, iterations=20, alpha=1.0, tv_weight=0.05)
+# - unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None, clip=True, rng=None)
+
+def joint_iterative_backprojection_wiener(lr_img, scale=2, num_iters=50, psf_update_freq=10, 
+                                          beta=0.7, wiener_iters=20, clip=True, rng=None):
+    """
+    Joint Iterative Backprojection with Unsupervised Wiener for blind super-resolution.
+    Calls iterative_backprojection_tv and unsupervised_wiener_improved.
+    
+    Input:
+        lr_img: Low-res degraded image (2D grayscale or 3D RGB, float [0,1])
+        scale: Downsampling factor (int, e.g., 2 for 2x upsampling)
+        num_iters: Max iterations for IBP loop
+        psf_update_freq: Run Wiener every N iterations to update PSF (int)
+        beta: Backprojection gain factor (float, 0.5-1.0 for stability)
+        wiener_iters: Iterations for unsupervised_wiener_improved (int, reduce for speed)
+        clip: Clip output to [0,1]
+        rng: np.random.Generator for Wiener (optional)
+    
+    Output:
+        hr_img: Restored high-res image (same type as input)
+        estimated_psf: Final estimated PSF (2D array)
+    """
+    # Handle RGB
+    is_rgb = len(np.shape(lr_img)) == 3 and lr_img.shape[-1] == 3
+    if is_rgb:
+        hr_img = np.zeros((lr_img.shape[0]*scale, lr_img.shape[1]*scale, 3))
+        psf_final = None
+        for c in range(3):
+            hr_img[..., c], psf = joint_iterative_backprojection_wiener(
+                lr_img[..., c], scale, num_iters, psf_update_freq, beta, wiener_iters, clip, rng
+            )
+            if c == 0:
+                psf_final = psf
+        if clip:
+            hr_img = np.clip(hr_img, 0, 1)
+        return hr_img, psf_final
+    
+    # Normalize
+    img = np.asarray(lr_img, dtype=float)
+    if img.max() > 1.0:
+        img /= 255.0
+    
+    # Target HR shape
+    hr_shape = (img.shape[0] * scale, img.shape[1] * scale)
+    
+    # Initialize HR: Bicubic upsample LR
+    hr_current = resize(img, hr_shape, order=3, anti_aliasing=True)  # Bicubic
+    
+    # Initial PSF estimate: Run Wiener on upsampled LR (or directly on LR)
+    small_img = resize(img, (min(128, hr_shape[0]), min(128, hr_shape[1])), order=3)
+    _, initial_psf = unsupervised_wiener_improved(small_img)
+    
+    # Resize PSF to match
+    psf_size = min(15, min(hr_shape))  # Limit PSF size
+    initial_psf = resize(initial_psf, (psf_size, psf_size), order=0)  # Nearest for kernel
+    initial_psf /= initial_psf.sum() + 1e-10  # Normalize
+    psf = initial_psf.copy()
+    
+    # IBP loop
+    prev_mse = float('inf')
+    for iter in range(num_iters):
+        # Call iterative_backprojection_tv with current PSF as kernel
+        hr_current = iterative_backprojection_tv(img, scale, psf)
+        
+        # Update PSF periodically
+        if (iter + 1) % psf_update_freq == 0:
+            # Downsample HR to pseudo-LR
+            pseudo_lr = resize(hr_current, img.shape, order=3, anti_aliasing=True)
+            
+            # Run Wiener to get new PSF
+            _, new_psf = unsupervised_wiener_improved(
+                pseudo_lr, psf_init=np.mean(np.diag(psf)) if psf.size > 1 else 1.0,
+                clip=clip, rng=rng
+            )
+            
+            # Resize and normalize new PSF
+            new_psf = resize(new_psf, (psf_size, psf_size), order=0)
+            new_psf /= new_psf.sum() + 1e-10
+            
+            # Smooth update to avoid oscillation
+            psf = 0.7 * psf + 0.3 * new_psf
+        
+        # Simulate LR for MSE check
+        blurred = np.real(ifft2(fft2(hr_current) * fft2(psf, s=hr_shape)))
+        simulated_lr = resize(blurred, img.shape, order=3, anti_aliasing=True)
+        error = img - simulated_lr
+        mse = np.mean(error**2)
+        
+        if abs(prev_mse - mse) < 1e-6 or mse < 1e-6:
+            break
+        prev_mse = mse
+    
+    return hr_current, psf
