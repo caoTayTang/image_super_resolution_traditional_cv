@@ -4,8 +4,15 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+try:
+    # When imported as package: src.anr_patch
+    from .interpolation import sr_interpolation
+except Exception:
+    # Fallback for script-style execution
+    from src.interpolation import sr_interpolation
 
 def rgb2yiq(img_rgb: np.ndarray) -> np.ndarray:
+    # NTSC color scheme
     M = np.array([[0.299,  0.587,  0.114],
                   [0.596, -0.274, -0.322],
                   [0.211, -0.523,  0.312]], dtype=np.float32)
@@ -13,6 +20,7 @@ def rgb2yiq(img_rgb: np.ndarray) -> np.ndarray:
     return (img_rgb.reshape(-1,3) @ M.T).reshape(h,w,3)
 
 def yiq2rgb(img_yiq: np.ndarray) -> np.ndarray:
+    # Inverse of NTSC color scheme
     M_inv = np.array([[1.0,  0.956,  0.621],
                       [1.0, -0.272, -0.647],
                       [1.0, -1.106,  1.703]], dtype=np.float32)
@@ -92,10 +100,15 @@ def _read_rgb(path: str) -> np.ndarray:
         raise FileNotFoundError(path)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
 
+# sr_interpolation(img, method) replace with sr_interpolation(img, "bicubic")
 def _bicubic_resize(img: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
+    # Deprecated in favor of sr_interpolation(..., method='bicubic', scale=s)
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
 def build_training_matrices(lr_dir: str, hr_dir: str, cfg: APlusConfig):
+    # Giai đoạn chuẩn bị dữ liệu huấn luyện cho A+:
+    # - Tạo ma trận đặc trưng X từ patch đặc trưng Y (đạo hàm) của ảnh LR đã nội suy lên HR (bicubic)
+    # - Tạo ma trận mục tiêu Y là phần dư (residual) giữa patch Y_HR và patch Y_bicubic (HR - bicubic)
     lr_list = sorted([os.path.join(lr_dir,f) for f in os.listdir(lr_dir) if f.lower().endswith(('.png','.jpg','.jpeg','.bmp'))])
     hr_list = sorted([os.path.join(hr_dir,f) for f in os.listdir(hr_dir) if f.lower().endswith(('.png','.jpg','.jpeg','.bmp'))])
     assert len(lr_list)==len(hr_list) and len(lr_list)>0, "LR/HR folders must be paired & non-empty"
@@ -103,17 +116,21 @@ def build_training_matrices(lr_dir: str, hr_dir: str, cfg: APlusConfig):
     all_X, all_Y = [], []
     ps = cfg.patch_size
     for lr_path, hr_path in zip(lr_list, hr_list):
+        # 1) Đọc ảnh và chuyển sang không gian YIQ, lấy kênh độ sáng Y
         lr_rgb = _read_rgb(lr_path)
         hr_rgb = _read_rgb(hr_path)
         lr_yiq = rgb2yiq(lr_rgb)
         hr_yiq = rgb2yiq(hr_rgb)
         lr_Y = lr_yiq[:,:,0]; hr_Y = hr_yiq[:,:,0]
+        # 2) Nội suy bicubic LR_Y lên kích thước HR theo scale
         H_hr, W_hr = hr_Y.shape
-        lr_Y_up = _bicubic_resize(lr_Y, W_hr, H_hr)
+        lr_Y_up = sr_interpolation(lr_Y, method='bicubic', scale=cfg.scale)
 
+        # 3) Tính đặc trưng từ Y_up (đạo hàm bậc 1/2) và trích các patch đặc trưng
         F = feature_map_from_y(lr_Y_up)
         X_raw, coords = extract_patches_from_feature_map(F, ps, cfg.step)
 
+        # 4) Tạo patch mục tiêu là phần dư Y_residual = Y_HR - Y_bicubic
         Y_hr = extract_y_patches(hr_Y, coords, ps)
         Y_lr = extract_y_patches(lr_Y_up, coords, ps)
         Y_residuals = (Y_hr - Y_lr).astype(np.float32)
@@ -130,17 +147,21 @@ def train_aplus(lr_dir: str, hr_dir: str, cfg: Optional[APlusConfig]=None) -> AP
         cfg = APlusConfig()
     np.random.seed(cfg.rng_seed)
 
+    # Bước 1: Trích xuất dữ liệu huấn luyện (X_raw đặc trưng patch, Y residual)
     X_raw, Y = build_training_matrices(lr_dir, hr_dir, cfg)
     assert X_raw.shape[0] > 0, "No training samples extracted."
 
+    # Bước 2: Giảm chiều + whitening với PCA để làm ổn định hồi quy
     pca = PCA(n_components=min(cfg.pca_dim, X_raw.shape[1]), random_state=cfg.rng_seed, whiten=True)
     X = pca.fit_transform(X_raw)
 
+    # Bước 3: Phân cụm KMeans trên không gian PCA để tạo các anchor (từ điển địa phương)
     kmeans = KMeans(n_clusters=cfg.n_anchors, random_state=cfg.rng_seed, n_init='auto')
     labels = kmeans.fit_predict(X)
 
     d = X.shape[1]; m = Y.shape[1]
     projections: List[np.ndarray] = []
+    # Bước 4: Với mỗi anchor, học ma trận chiếu tuyến tính (ridge regression)
     for a in range(cfg.n_anchors):
         idx = np.where(labels==a)[0]
         Xa = X if len(idx) < d+1 else X[idx]
@@ -159,49 +180,101 @@ def save_model(model: APlusModel, path: str):
 def load_model(path: str) -> APlusModel:
     with open(path, 'rb') as f: return pickle.load(f)
 
-def predict_image_aplus(lr_path: str, model: APlusModel) -> np.ndarray:
+def predict_image_aplus_array(lr_rgb: np.ndarray, model: APlusModel) -> np.ndarray:
+    """
+    Predict SR result from an in-memory RGB image (H,W,3).
+    Accepts uint8 [0-255] or float [0..1]/[0..255]. Returns RGB uint8.
+    """
     cfg = model.cfg
-    lr_rgb = _read_rgb(lr_path)
+
+    # Bước 0: Chuẩn hóa dữ liệu ảnh về [0,1]
+    lr_rgb = lr_rgb.astype(np.float32)
+    if lr_rgb.max() > 1.5:
+        lr_rgb = lr_rgb / 255.0
+
     H_lr, W_lr, _ = lr_rgb.shape
     s = cfg.scale
 
+    # Bước 1: Chuyển RGB -> YIQ và tách các kênh
     lr_yiq = rgb2yiq(lr_rgb)
-    Y = lr_yiq[:,:,0]; I = lr_yiq[:,:,1]; Q = lr_yiq[:,:,2]
+    Y = lr_yiq[:, :, 0]; I = lr_yiq[:, :, 1]; Q = lr_yiq[:, :, 2]
 
-    H_hr, W_hr = H_lr*s, W_lr*s
-    Y_up = _bicubic_resize(Y, W_hr, H_hr)
-    I_hr = _bicubic_resize(I, W_hr, H_hr)
-    Q_hr = _bicubic_resize(Q, W_hr, H_hr)
+    # Bước 2: Nội suy bicubic Y, I, Q lên kích thước HR theo scale
+    H_hr, W_hr = H_lr * s, W_lr * s
+    Y_up = sr_interpolation(Y, method='bicubic', scale=s)
+    I_hr = sr_interpolation(I, method='bicubic', scale=s)
+    Q_hr = sr_interpolation(Q, method='bicubic', scale=s)
 
+    # Bước 3: Tính đặc trưng từ Y_up và trích patch đặc trưng
     F = feature_map_from_y(Y_up)
     X_raw, coords = extract_patches_from_feature_map(F, cfg.patch_size, cfg.step)
     if not coords:
         yiq = np.stack([Y_up, I_hr, Q_hr], -1)
         rgb = np.clip(yiq2rgb(yiq), 0, 1)
-        return (rgb*255.0 + 0.5).astype(np.uint8)
+        return (rgb * 255.0 + 0.5).astype(np.uint8)
 
+    # Bước 4: Ánh xạ đặc trưng qua PCA và gán anchor gần nhất
     X = model.pca.transform(X_raw)
 
     centers = model.kmeans.cluster_centers_
-    x2 = np.sum(X*X, axis=1, keepdims=True)
-    c2 = np.sum(centers*centers, axis=1, keepdims=True).T
-    dist2 = x2 + c2 - 2.0*(X @ centers.T)
+    x2 = np.sum(X * X, axis=1, keepdims=True)
+    c2 = np.sum(centers * centers, axis=1, keepdims=True).T
+    dist2 = x2 + c2 - 2.0 * (X @ centers.T)
     nearest = np.argmin(dist2, axis=1)
 
+    # Bước 5: Với mỗi anchor, áp dụng ma trận chiếu để dự đoán phần dư Y
     preds = np.zeros((X.shape[0], model.patch_dim), np.float32)
     for a in range(cfg.n_anchors):
-        idx = np.where(nearest==a)[0]
-        if len(idx)==0: continue
+        idx = np.where(nearest == a)[0]
+        if len(idx) == 0:
+            continue
         P = model.projections[a]
         preds[idx] = X[idx] @ P
 
+    # Bước 6: Cộng residual vào Y_bicubic và ghép lại ảnh Y theo cơ chế overlap-add
     Y_base = extract_y_patches(Y_up, coords, cfg.patch_size)
     Y_patches = Y_base + preds
     Y_rec = reconstruct_from_patches(coords, Y_patches, H_hr, W_hr, cfg.patch_size)
 
+    # Bước 7: Ghép kênh Y tái tạo với I/Q nội suy và chuyển YIQ -> RGB
     yiq = np.stack([Y_rec, I_hr, Q_hr], -1)
     rgb = np.clip(yiq2rgb(yiq), 0, 1)
-    return (rgb*255.0 + 0.5).astype(np.uint8)
+    return (rgb * 255.0 + 0.5).astype(np.uint8)
+
+def predict_image_aplus(lr_path: str, model: APlusModel) -> np.ndarray:
+
+    lr_rgb = _read_rgb(lr_path)
+    return predict_image_aplus_array(lr_rgb, model)
+
+def sr_anr(
+    img,
+    ckpt_path: str,
+    train_lr_dir: Optional[str] = None,
+    train_hr_dir: Optional[str] = None,
+    cfg_dict: Optional[dict] = None,
+    input_bgr: bool = True,
+) -> np.ndarray:
+    # Hàm tiện ích cấp cao:
+    # - Bước 1: Nếu có checkpoint thì load; nếu chưa có sẽ train A+ từ thư mục LR/HR
+    # - Bước 2: Dự đoán cho ảnh (đường dẫn hoặc mảng numpy). Nếu là BGR thì chuyển sang RGB trước khi xử lý
+    if os.path.exists(ckpt_path):
+        model = load_model(ckpt_path)
+    else:
+        if not train_lr_dir or not train_hr_dir:
+            raise ValueError("train_lr_dir/train_hr_dir are required to train when checkpoint is missing.")
+        cfg = APlusConfig(**cfg_dict) if cfg_dict is not None else APlusConfig()
+        model = train_aplus(train_lr_dir, train_hr_dir, cfg)
+        save_model(model, ckpt_path)
+
+    if isinstance(img, str):
+        return predict_image_aplus(img, model)
+    elif isinstance(img, np.ndarray):
+        lr_rgb = img
+        if input_bgr:
+            lr_rgb = cv2.cvtColor(lr_rgb, cv2.COLOR_BGR2RGB)
+        return predict_image_aplus_array(lr_rgb, model)
+    else:
+        raise TypeError("img must be a filepath (str) or a numpy array")
 
 def train_and_save(lr_dir: str, hr_dir: str, ckpt_path: str, cfg_dict: Optional[dict]=None) -> str:
     cfg = APlusConfig(**cfg_dict) if cfg_dict is not None else APlusConfig()
