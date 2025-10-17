@@ -1,97 +1,134 @@
-# Wiener_Filter.py
-"""
-Traditional restoration pipeline (Wiener + RL + TV + optional pre/post denoise)
-
-Dependencies:
-    numpy, scipy, scikit-image (skimage), opencv-python
-Install (if needed):
-    pip install numpy scipy scikit-image opencv-python
-"""
-
-import os
 import numpy as np
-import cv2
-from scipy.signal import wiener as adaptive_wiener
-from numpy.fft import fft2, ifft2, ifftshift
-from scipy.fft import fft2, ifft2, fftfreq, fftshift
-from skimage import img_as_float, color
-from skimage.transform import resize
-from skimage.restoration import (
-    unsupervised_wiener,
-    richardson_lucy,
-    denoise_tv_chambolle,
-    estimate_sigma as skimage_estimate_sigma,
-)
+from scipy.fft import fft2, ifft2, fftfreq, fftshift, rfftn, irfftn
+from scipy.signal import convolve2d, fftconvolve
+from scipy.fft import rfftn, irfftn
 from scipy.ndimage import gaussian_filter
-from src.models import iterative_backprojection_tv
 
 
 
-def unsupervised_wiener_custom(image, psf_init=None, iterations=10, clip=True, balance=0.1):
+def _pad_to_shape(ir, shape):
+    """Zero-pad IR đến cùng kích thước ảnh và circular shift tâm về (0,...)."""
+    out = np.zeros(shape, dtype=ir.dtype)
+    insert_slices = tuple(slice(0, s) for s in ir.shape)
+    out[insert_slices] = ir
+    for ax, k in enumerate(ir.shape):
+        out = np.roll(out, - (k // 2), axis=ax)
+    return out
+
+
+def _laplacian_ir(ndim=2):
+    """Sinh Laplacian kernel kích thước 3^N."""
+    shape = (3,) * ndim
+    ir = np.zeros(shape, dtype=float)
+    center = (shape[0] // 2,) * ndim
+    ir[center] = -2 * ndim
+    for ax in range(ndim):
+        idx_plus = list(center)
+        idx_minus = list(center)
+        idx_plus[ax] = 2
+        idx_minus[ax] = 0
+        ir[tuple(idx_plus)] = 1.0
+        ir[tuple(idx_minus)] = 1.0
+    return ir
+
+
+def _gaussian_psf(size=5, sigma=1.5, ndim=2):
+    """Sinh Gaussian PSF chuẩn hóa (sum=1)."""
+    # tạo grid
+    coords = [np.arange(size) - size // 2 for _ in range(ndim)]
+    grids = np.meshgrid(*coords, indexing='ij')
+    dist2 = sum((g ** 2 for g in grids))
+    psf = np.exp(-dist2 / (2 * sigma ** 2))
+    psf /= psf.sum()
+    return psf
+
+
+def wiener_base_real(image, psf=None, balance=0.01, reg=None,
+                     clip=True, eps=1e-12, psf_size=5, psf_sigma=1.5):
     """
-    Tái hiện hàm restoration.unsupervised_wiener của scikit-image.
-    Input:
-        image: Ảnh grayscale (2D array, float [0,1] hoặc [0,255])
-        psf_init: Kernel khởi tạo (2D array, nếu None thì dùng Gaussian 5x5)
-        iterations: Số lần lặp để tinh chỉnh kernel
-        clip: Có clip ảnh khôi phục về [0,1] không
-        balance: Tham số regularization (tương tự K trong Wiener filter)
-    Output:
-        deconvolved: Ảnh khôi phục
-        psf: Kernel ước lượng
+    Wiener deconvolution cho ảnh thực
+
+    Parameters
+    ----------
+    image : ndarray
+        Ảnh đầu vào (real-valued).
+    psf : ndarray or None
+        Point Spread Function (impulse response). Nếu None → Gaussian.
+    balance : float
+        Hệ số điều chỉnh λ giữa fidelity và regularization.
+    reg : ndarray or None
+        Toán tử regularization (mặc định Laplacian).
+    clip : bool
+        Nếu True, giới hạn output về [-1,1].
+    eps : float
+        Giá trị nhỏ tránh chia cho 0.
+    psf_size : int
+        Kích thước kernel Gaussian mặc định.
+    psf_sigma : float
+        Sigma mặc định cho PSF Gaussian.
+
+    Returns
+    -------
+    ndarray : ảnh khôi phục (cùng shape với input)
     """
-    # Chuẩn hóa ảnh
-    img = np.asarray(image, dtype=float)
-    if img.max() > 1.0:
-        img = img / 255.0  # Giả sử ảnh [0,255] nếu không chuẩn hóa
+    image = np.asarray(image, dtype=np.float64)
+    ndim = image.ndim
+    shape = image.shape
 
-    # Khởi tạo kernel nếu không cung cấp
-    if psf_init is None:
-        psf = np.ones((5, 5)) / 25  # Kernel Gaussian nhỏ
-        psf = gaussian_filter(psf, sigma=1)
-        psf /= psf.sum()
-    else:
-        psf = np.asarray(psf_init, dtype=float)
-        psf /= psf.sum()
+    # PSF mặc định = Gaussian kernel
+    if psf is None:
+        psf = _gaussian_psf(psf_size, psf_sigma, ndim)
 
-    # Wiener filter cơ bản
-    def wiener_step(img, kernel, K):
-        kernel = kernel / np.sum(kernel)
-        dummy = np.copy(img)
-        dummy = fft2(dummy)
-        kernel = fft2(kernel, s=img.shape)
-        kernel = np.conj(kernel) / (np.abs(kernel)**2 + K)
-        dummy = dummy * kernel
-        dummy = np.abs(ifft2(dummy))
-        return dummy
+    # Regularization mặc định = Laplacian
+    if reg is None:
+        reg = _laplacian_ir(ndim)
 
-    # Lặp để tinh chỉnh kernel
-    deconvolved = np.copy(img)
-    for _ in range(iterations):
-        # Bước 1: Khôi phục ảnh với kernel hiện tại
-        deconvolved = wiener_step(img, psf, balance)
-        if clip:
-            deconvolved = np.clip(deconvolved, 0, 1)
+    # Fourier transform
+    H = rfftn(_pad_to_shape(psf, shape))
+    D = rfftn(_pad_to_shape(reg, shape))
+    Y = rfftn(image)
 
-        # Bước 2: Ước lượng kernel mới
-        # Dùng cross-correlation giữa ảnh gốc và ảnh khôi phục
-        psf_new = np.real(ifft2(fft2(img) * np.conj(fft2(deconvolved))))
-        psf_new = np.clip(psf_new, 0, None)  # Giữ positive
-        psf_new = psf_new[0:psf.shape[0], 0:psf.shape[1]]  # Cắt về kích thước ban đầu
-        psf_new /= psf_new.sum() + 1e-6  # Normalize
+    # Wiener filter: conj(H) / (|H|^2 + λ|D|^2)
+    denom = np.abs(H)**2 + balance * np.abs(D)**2
+    denom = np.where(denom < eps, eps, denom)
+    W = np.conj(H) / denom
 
-        # Cập nhật kernel (tránh dao động lớn)
-        psf = 0.5 * psf + 0.5 * psf_new
+    # Áp dụng và inverse FFT
+    X = irfftn(W * Y, s=shape)
 
-    # Wiener filter cuối cùng với kernel tối ưu
-    deconvolved = wiener_step(img, psf, balance)
     if clip:
-        deconvolved = np.clip(deconvolved, 0, 1)
+        X = np.clip(X, -1.0, 1.0)
 
-    return deconvolved, psf
+    return X
 
 
-def unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None, clip=True, rng=None):
+# Generate Gaussian PSF with correct centering
+def get_psf_sigma(sigma, shape):
+    x = np.arange(-shape[0]//2, shape[0]//2)
+    y = np.arange(-shape[1]//2, shape[1]//2)
+    X, Y = np.meshgrid(x, y)  # Correct order: x, y
+    psf = np.exp(-(X**2 + Y**2) / (2 * sigma**2))
+    psf /= psf.sum()
+    return fftshift(psf)  # Center the PSF
+
+# Wiener filter cơ bản
+def wiener_base(img, kernel, K=0.01):
+    """
+    img: Ảnh bị mờ (2D array, float [0,1])
+    kernel: Kernel mờ (2D array, float) - Dự đoán
+    K: Hằng số ổn định (float, thường nhỏ, ví dụ 0.01)
+    """
+    kernel = kernel / np.sum(kernel)
+    dummy = np.copy(img)
+    dummy = fft2(dummy)
+    kernel = fft2(kernel, s=img.shape)
+    kernel = np.conj(kernel) / (np.abs(kernel)**2 + K)
+    dummy = dummy * kernel
+    dummy = np.real(ifft2(dummy))
+    return dummy
+
+
+def unsupervised_wiener_improved(image, psf_init=1, reg=None, user_params=None, clip=True, rng=None):
     """
     Improved unsupervised Wiener filter for grayscale or RGB images using Gibbs sampler.
     Fixes quadrant swap and 180-degree flip issues by centering PSF and correct meshgrid indexing.
@@ -140,15 +177,6 @@ def unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None
         fy = fftfreq(shape[1])
         FX, FY = np.meshgrid(fx, fy)  # Correct order: x, y
         reg = 2 * (2 - np.cos(2 * np.pi * FX) - np.cos(2 * np.pi * FY))
-
-    # Generate Gaussian PSF with correct centering
-    def get_psf_sigma(sigma, shape):
-        x = np.arange(-shape[0]//2, shape[0]//2)
-        y = np.arange(-shape[1]//2, shape[1]//2)
-        X, Y = np.meshgrid(x, y)  # Correct order: x, y
-        psf = np.exp(-(X**2 + Y**2) / (2 * sigma**2))
-        psf /= psf.sum()
-        return fftshift(psf)  # Center the PSF
 
     psf = get_psf_sigma(psf_init, shape)
     Lambda_H = fft2(psf)  # PSF transfer function
@@ -224,98 +252,136 @@ def unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None
     return deconvolved, estimated_psf
 
 
-# Assuming the following functions are defined elsewhere:
-# - iterative_backprojection_tv(lr, scale, kernel, iterations=20, alpha=1.0, tv_weight=0.05)
-# - unsupervised_wiener_improved(image, psf_init=5.0, reg=None, user_params=None, clip=True, rng=None)
 
-def joint_iterative_backprojection_wiener(lr_img, scale=2, num_iters=50, psf_update_freq=10, 
-                                          beta=0.7, wiener_iters=20, clip=True, rng=None):
-    """
-    Joint Iterative Backprojection with Unsupervised Wiener for blind super-resolution.
-    Calls iterative_backprojection_tv and unsupervised_wiener_improved.
+# Helper function to pad kernel to a given shape and compute FFT
+def fft_pad(kernel, shape):
+    pad_y = shape[0] - kernel.shape[0]
+    pad_x = shape[1] - kernel.shape[1]
+    pad_top = pad_y // 2
+    pad_bottom = pad_y - pad_top
+    pad_left = pad_x // 2
+    pad_right = pad_x - pad_left
+    padded = np.pad(kernel, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
+    return np.fft.fft2(padded)
+
+# Compute |D|^2 in frequency domain (D is gradient operator)
+def get_D_power(shape):
+    # Horizontal gradient kernel [1, -1]
+    dx = np.array([[1, -1]])
+    # Vertical gradient kernel [1; -1]
+    dy = np.array([[1], [-1]])
+    Dx = fft_pad(dx, shape)
+    Dy = fft_pad(dy, shape)
+    return np.abs(Dx)**2 + np.abs(Dy)**2
+
+# Learn restoration filter w1 using FD closed-form and crop to spatial domain
+def learn_restoration_filter(h, gamma, s, fft_shape=(256, 256)):
+    H = fft_pad(h, fft_shape)
+    D2 = get_D_power(fft_shape)
+    # Wiener-like filter in FD
+    W = np.conj(H) / (np.abs(H)**2 + (1 / gamma) * D2 + 1e-10)  # Small epsilon to avoid division issues
+    w_fd = np.fft.ifft2(W).real
+    # Crop center to s x s
+    half = s // 2
+    center_y, center_x = fft_shape[0] // 2, fft_shape[1] // 2
+    w_crop = w_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
+    # Adjust to preserve sum (DC component)
+    current_sum = np.sum(w_crop)
+    desired_sum = np.real(W[0, 0])
+    add = (desired_sum - current_sum) / (s * s)
+    w1 = w_crop + add
+    return w1
+
+# Learn update filters w2x and w2y using FD closed-form and crop to spatial domain
+def learn_update_filters(h, gamma, beta, s, fft_shape=(256, 256)):
+    H = fft_pad(h, fft_shape)
+    D2 = get_D_power(fft_shape)
+    denom = D2 + (gamma / beta) * np.abs(H)**2 + 1e-10  # Small epsilon
+    # Horizontal
+    dx = np.array([[1, -1]])
+    Dx = fft_pad(dx, fft_shape)
+    Wx = np.conj(Dx) / denom
+    wx_fd = np.fft.ifft2(Wx).real
+    half = s // 2
+    center_y, center_x = fft_shape[0] // 2, fft_shape[1] // 2
+    wx_crop = wx_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
+    current_sum_x = np.sum(wx_crop)
+    desired_sum_x = np.real(Wx[0, 0])
+    add_x = (desired_sum_x - current_sum_x) / (s * s)
+    wx = wx_crop + add_x
+    # Vertical
+    dy = np.array([[1], [-1]])
+    Dy = fft_pad(dy, fft_shape)
+    Wy = np.conj(Dy) / denom
+    wy_fd = np.fft.ifft2(Wy).real
+    wy_crop = wy_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
+    current_sum_y = np.sum(wy_crop)
+    desired_sum_y = np.real(Wy[0, 0])
+    add_y = (desired_sum_y - current_sum_y) / (s * s)
+    wy = wy_crop + add_y
+    return wx, wy
+
+# Compute image gradients (Du)
+def compute_gradient(u):
+    dx = np.array([[1, -1]])
+    dy = np.array([[1], [-1]])
+    ux = convolve2d(u, dx, mode='same')
+    uy = convolve2d(u, dy, mode='same')
+    return ux, uy
+
+# Iterative Wiener Filtering and Thresholding (IWFT) - Algorithm 2
+def iwft(g, gamma, h=None, beta=None, s=15, N=15, tol=1e-4, fft_shape=(256, 256)):
+
+    if h is None:
+        h = np.ones((5, 5)) / 25.0  
+    # Learn filters
+    w1 = learn_restoration_filter(h, gamma, s, fft_shape)
+    wx, wy = learn_update_filters(h, gamma, beta if beta else 10 * np.max(g), s, fft_shape)
     
-    Input:
-        lr_img: Low-res degraded image (2D grayscale or 3D RGB, float [0,1])
-        scale: Downsampling factor (int, e.g., 2 for 2x upsampling)
-        num_iters: Max iterations for IBP loop
-        psf_update_freq: Run Wiener every N iterations to update PSF (int)
-        beta: Backprojection gain factor (float, 0.5-1.0 for stability)
-        wiener_iters: Iterations for unsupervised_wiener_improved (int, reduce for speed)
-        clip: Clip output to [0,1]
-        rng: np.random.Generator for Wiener (optional)
+    # Initial estimation
+    u1 = convolve2d(g, w1, mode='same')
+    u = u1.copy()
     
-    Output:
-        hr_img: Restored high-res image (same type as input)
-        estimated_psf: Final estimated PSF (2D array)
-    """
-    # Handle RGB
-    is_rgb = len(np.shape(lr_img)) == 3 and lr_img.shape[-1] == 3
-    if is_rgb:
-        hr_img = np.zeros((lr_img.shape[0]*scale, lr_img.shape[1]*scale, 3))
-        psf_final = None
-        for c in range(3):
-            hr_img[..., c], psf = joint_iterative_backprojection_wiener(
-                lr_img[..., c], scale, num_iters, psf_update_freq, beta, wiener_iters, clip, rng
-            )
-            if c == 0:
-                psf_final = psf
-        if clip:
-            hr_img = np.clip(hr_img, 0, 1)
-        return hr_img, psf_final
+    # Default beta if not provided
+    if beta is None:
+        beta = 10 * np.max(g)
     
-    # Normalize
-    img = np.asarray(lr_img, dtype=float)
-    if img.max() > 1.0:
-        img /= 255.0
+    # Initialize a (Lagrange multiplier, 2 channels)
+    ax = np.zeros_like(g)
+    ay = np.zeros_like(g)
     
-    # Target HR shape
-    hr_shape = (img.shape[0] * scale, img.shape[1] * scale)
-    
-    # Initialize HR: Bicubic upsample LR
-    hr_current = resize(img, hr_shape, order=3, anti_aliasing=True)  # Bicubic
-    
-    # Initial PSF estimate: Run Wiener on upsampled LR (or directly on LR)
-    small_img = resize(img, (min(128, hr_shape[0]), min(128, hr_shape[1])), order=3)
-    _, initial_psf = unsupervised_wiener_improved(small_img)
-    
-    # Resize PSF to match
-    psf_size = min(15, min(hr_shape))  # Limit PSF size
-    initial_psf = resize(initial_psf, (psf_size, psf_size), order=0)  # Nearest for kernel
-    initial_psf /= initial_psf.sum() + 1e-10  # Normalize
-    psf = initial_psf.copy()
-    
-    # IBP loop
-    prev_mse = float('inf')
-    for iter in range(num_iters):
-        # Call iterative_backprojection_tv with current PSF as kernel
-        hr_current = iterative_backprojection_tv(img, scale, psf)
+    k = N
+    while k > 0:
+        u_old = u.copy()
         
-        # Update PSF periodically
-        if (iter + 1) % psf_update_freq == 0:
-            # Downsample HR to pseudo-LR
-            pseudo_lr = resize(hr_current, img.shape, order=3, anti_aliasing=True)
-            
-            # Run Wiener to get new PSF
-            _, new_psf = unsupervised_wiener_improved(
-                pseudo_lr, psf_init=np.mean(np.diag(psf)) if psf.size > 1 else 1.0,
-                clip=clip, rng=rng
-            )
-            
-            # Resize and normalize new PSF
-            new_psf = resize(new_psf, (psf_size, psf_size), order=0)
-            new_psf /= new_psf.sum() + 1e-10
-            
-            # Smooth update to avoid oscillation
-            psf = 0.7 * psf + 0.3 * new_psf
+        # Compute Du
+        ux, uy = compute_gradient(u)
         
-        # Simulate LR for MSE check
-        blurred = np.real(ifft2(fft2(hr_current) * fft2(psf, s=hr_shape)))
-        simulated_lr = resize(blurred, img.shape, order=3, anti_aliasing=True)
-        error = img - simulated_lr
-        mse = np.mean(error**2)
+        # Compute norm ||Du - a||_2
+        diff_x = ux - ax
+        diff_y = uy - ay
+        norm2 = np.sqrt(diff_x**2 + diff_y**2)
         
-        if abs(prev_mse - mse) < 1e-6 or mse < 1e-6:
+        # Soft thresholding
+        thresh = np.maximum(norm2 - 1 / beta, 0)
+        denom = norm2 + 1e-10  # Avoid division by zero
+        vx = diff_x * (thresh / denom)
+        vy = diff_y * (thresh / denom)
+        
+        # Update a
+        ax = ax - ux + vx
+        ay = ay - uy + vy
+        
+        # Update u
+        update_x = convolve2d(vx + ax, wx, mode='same')
+        update_y = convolve2d(vy + ay, wy, mode='same')
+        u = u1 + update_x + update_y
+        
+        # Check relative tolerance
+        rel_change = np.linalg.norm(u - u_old) / (np.linalg.norm(u_old) + 1e-10)
+        if rel_change < tol:
             break
-        prev_mse = mse
+        
+        k -= 1
     
-    return hr_current, psf
+    return u
