@@ -3,16 +3,16 @@ import numpy as np
 import os
 from src.metrics import compute_basic_metrics
 from modules.degradation import degrade_image
-from skimage import restoration
-from src.models import iterative_backprojection_tv
-from src.Wiener_Filter import unsupervised_wiener_custom, unsupervised_wiener_improved, joint_iterative_backprojection_wiener
+from skimage.restoration import wiener, unsupervised_wiener
+from scipy.ndimage import gaussian_filter
+from src.Wiener_Filter import unsupervised_wiener_improved, iwft, wiener_base, wiener_base_real
 
 def load_image(image_path):
     """
     Load image từ đường dẫn
     Returns: numpy array in [0,1] float
     """
-    img = cv2.imread(image_path)
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"Cannot load image from {image_path}")
     if img.shape[-1] == 4:
@@ -20,7 +20,8 @@ def load_image(image_path):
         img = img[..., :3]
     
     # Convert BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
     # Convert to float [0,1]
     img = img.astype(np.float32) / 255.0
@@ -60,7 +61,7 @@ def test_image_restoration(image_path):
     
     # 2. Degrade image (blur + downscale)
     print("2. Degrading image...")
-    degraded_img = degrade_image(original_img, scale=4)
+    degraded_img = degrade_image(original_img, scale=1)
     print(f"   Degraded image shape: {degraded_img.shape}")
     
     # Save degraded low-resolution image
@@ -69,13 +70,21 @@ def test_image_restoration(image_path):
     
     # 3. Restore image using Wiener Filter
     print("3. Restoring image...")
-    # restored_img = np.zeros_like(original_img)
-    # for c in range(3):
-    #     # restored_img[..., c], _ = restoration.unsupervised_wiener(degraded_img[..., c])
-    #     restored_img[..., c], _ = unsupervised_wiener_custom(degraded_img[..., c], psf_init=None, iterations=200, balance=0.1)
+    
+    
     # restored_img, _ = unsupervised_wiener_improved(degraded_img)
-    # restored_img = iterative_backprojection_tv(degraded_img, scale=1)
-    restored_img, _ = joint_iterative_backprojection_wiener(degraded_img, scale=4, num_iters=20, psf_update_freq=2)
+    # restored_img = iwft(degraded_img, gamma=10**4, s=30, N=20)
+    # restored_img = iterative_backprojection_tv(degraded_img, scale=1))
+
+    kernel = np.zeros((5, 5))
+    kernel[2, 2] = 1  # Impulse at center
+    kernel = gaussian_filter(kernel, sigma=1)
+    kernel /= np.sum(kernel)  # Normalize
+    
+    restored_img = wiener_base_real(degraded_img)
+    # restored_img = wiener(degraded_img, kernel, balance=0.01)
+    # restored_img, _ = unsupervised_wiener(degraded_img, kernel)
+    # restored_img, _ = unsupervised_wiener_improved(degraded_img)
     print(f"   Restored image shape: {restored_img.shape}")
     
     # Save predicted super-resolution image
