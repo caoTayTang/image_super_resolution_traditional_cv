@@ -4,7 +4,7 @@ from modules.downsample import blur, simulate_lr_from_hr
 from modules.degradation import gaussian_kernel
 from modules.upsample import upsample_nearest
 
-def iterative_backprojection(lr, upsample=upsample_nearest, scale=4, iterations=20, alpha=1.0, size=9, sigma=1.6):
+def iterative_backprojection(lr, kernel = None, upsample=upsample_nearest, scale=4, iterations=20, alpha=1.0, size=9, sigma=1.6):
     """
     Iterative Back-Projection + Total Variation Denoising
     - lr: ảnh LR
@@ -16,8 +16,8 @@ def iterative_backprojection(lr, upsample=upsample_nearest, scale=4, iterations=
     """
     target_h = lr.shape[0] * scale
     target_w = lr.shape[1] * scale
-    
-    kernel = gaussian_kernel(size, sigma)
+    if kernel is None:
+        kernel = gaussian_kernel(size, sigma)
 
     x = upsample(lr, scale)
 

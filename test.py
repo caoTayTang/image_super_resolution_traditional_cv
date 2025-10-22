@@ -2,10 +2,11 @@ import cv2
 import numpy as np
 import os
 from src.metrics import compute_basic_metrics
-from modules.degradation import degrade_image
-from skimage.restoration import wiener, unsupervised_wiener
+from skimage.restoration import unsupervised_wiener as sk_unsupervised_wiener
 from scipy.ndimage import gaussian_filter
-from src.Wiener_Filter import unsupervised_wiener_improved, iwft, wiener_base, wiener_base_real
+from src.Wiener_Filter import gaussian_psf, wiener_base_real, unsupervised_wiener_improved1
+from src.models import iterative_backprojection
+from modules.upsample import upsample_bicubic
 
 def load_image(image_path):
     """
@@ -45,55 +46,37 @@ def save_image(img, save_path):
     cv2.imwrite(save_path, img_uint8)
     print(f"   Saved: {save_path}")
 
-def test_image_restoration(image_path):
+def test_image_restoration(degraded_path, hr_path):
     """
-    Test pipeline: load -> degrade -> restore -> compute metrics
+    Test pipeline: load degraded image and corresponding HR image -> restore -> compute metrics
     """
-    print(f"Testing image restoration pipeline for: {image_path}")
+    print(f"Testing image restoration pipeline for degraded image: {degraded_path}")
     
     # Get image name for saving
-    image_name = os.path.splitext(os.path.basename(image_path))[0]
+    image_name = os.path.splitext(os.path.basename(degraded_path))[0]
     
-    # 1. Load original image
-    print("1. Loading original image...")
-    original_img = load_image(image_path)
-    print(f"   Image shape: {original_img.shape}")
-    
-    # 2. Degrade image (blur + downscale)
-    print("2. Degrading image...")
-    degraded_img = degrade_image(original_img, scale=1)
+    # 1. Load degraded and HR images
+    print("1. Loading degraded and HR images...")
+    degraded_img = load_image(degraded_path)
+    original_img = load_image(hr_path)
     print(f"   Degraded image shape: {degraded_img.shape}")
+    print(f"   HR image shape: {original_img.shape}")
     
-    # Save degraded low-resolution image
-    print("   Saving degraded LR image...")
-    save_image(degraded_img, f"data/degraded_lr/{image_name}_degraded_lr.png")
-    
-    # 3. Restore image using Wiener Filter
-    print("3. Restoring image...")
-    
-    
-    # restored_img, _ = unsupervised_wiener_improved(degraded_img)
-    # restored_img = iwft(degraded_img, gamma=10**4, s=30, N=20)
-    # restored_img = iterative_backprojection_tv(degraded_img, scale=1))
+    # 2. Restore image using Wiener Filter
+    print("2. Restoring image...")
+    restored_img = degraded_img.copy()
+    restored_img = upsample_bicubic(restored_img, scale=4)
+    restored_img = wiener_base_real(restored_img)
 
-    kernel = np.zeros((5, 5))
-    kernel[2, 2] = 1  # Impulse at center
-    kernel = gaussian_filter(kernel, sigma=1)
-    kernel /= np.sum(kernel)  # Normalize
-    
-    restored_img = wiener_base_real(degraded_img)
-    # restored_img = wiener(degraded_img, kernel, balance=0.01)
-    # restored_img, _ = unsupervised_wiener(degraded_img, kernel)
-    # restored_img, _ = unsupervised_wiener_improved(degraded_img)
     print(f"   Restored image shape: {restored_img.shape}")
     
     # Save predicted super-resolution image
     print("   Saving predicted SR image...")
     save_image(restored_img, f"data/predicted_sr/{image_name}_predicted_sr.png")
     
-    # 4. Compute metrics
-    print("4. Computing metrics...")
-    metrics = compute_basic_metrics(restored_img, original_img, multichannel=(original_img.ndim==3))
+    # 3. Compute metrics
+    print("3. Computing metrics...")
+    metrics = compute_basic_metrics(restored_img, original_img, multichannel=(original_img.ndim == 3))
     
     print("\n=== METRICS RESULTS ===")
     for metric_name, value in metrics.items():
@@ -108,22 +91,20 @@ def test_image_restoration(image_path):
 
 if __name__ == "__main__":
     # Create necessary directories
-    os.makedirs("data/degraded_lr", exist_ok=True)
     os.makedirs("data/predicted_sr", exist_ok=True)
     os.makedirs("results", exist_ok=True)
     
-    # Test với một ảnh mẫu
-    # Thay đổi đường dẫn này theo ảnh của bạn
-    init_psf = np.ones((5, 5)) / 25
-    image_path = "data/input_hr/cameraman.png"
+    # Đường dẫn đến ảnh degraded và HR
+    degraded_path = "data/degraded_lr/img_001_SRF_4_LR.png"
+    hr_path = "data/input_hr/img_001_SRF_4_HR.png"
     
     try:
-        results = test_image_restoration(image_path)
+        results = test_image_restoration(degraded_path, hr_path)
         print("\nTest completed successfully!")
         
         # Save comparison results
-        print("\n5. Saving comparison results...")
-        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        print("\n4. Saving comparison results...")
+        image_name = os.path.splitext(os.path.basename(degraded_path))[0]
         
         # Save original HR image for comparison
         save_image(results['original'], f"results/{image_name}_original_hr.png")
@@ -135,7 +116,6 @@ if __name__ == "__main__":
         save_image(results['restored'], f"results/{image_name}_restored_sr.png")
         
         print("\nFiles saved:")
-        print(f"├── data/degraded_lr/{image_name}_degraded_lr.png")
         print(f"├── data/predicted_sr/{image_name}_predicted_sr.png")
         print(f"├── results/{image_name}_original_hr.png")
         print(f"├── results/{image_name}_degraded_lr.png")
@@ -143,7 +123,3 @@ if __name__ == "__main__":
             
     except Exception as e:
         print(f"Error during testing: {e}")
-        print("Make sure:")
-        print("1. Image path is correct")
-        print("2. modules/degradation.py has degrade_image function")
-        print("3. src/Wiener_Filter.py has restore_image function")
