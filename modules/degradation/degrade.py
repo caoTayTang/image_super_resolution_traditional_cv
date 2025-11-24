@@ -28,6 +28,7 @@ def gaussian_kernel(size=9, sigma=1.6):
     kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
     return kernel / np.sum(kernel)
 
+
 def degrade_image(hr, scale=4, kernel=None, noise_type="gaussian", noise_std=0.01):
     if kernel is None:
         kernel = gaussian_kernel(9, 1.6)
