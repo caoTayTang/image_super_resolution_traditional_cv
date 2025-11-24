@@ -1,8 +1,7 @@
 import numpy as np
 from scipy.fft import fft2, ifft2, fftfreq, fftshift, rfftn, irfftn
-from scipy.signal import convolve2d, fftconvolve
 from scipy.fft import rfftn, irfftn
-from scipy.ndimage import gaussian_filter
+from numpy.random import gamma as sample_gamma
 
 
 
@@ -101,431 +100,183 @@ def wiener_base_real(image, psf=None, balance=0.01, reg=None,
 
     return X
 
-
-def unsupervised_wiener_improved1(image, psf_sigma_init=1.5, reg_tf=None, user_params=None, clip=True, rng=None):
+def wiener_unsupervised_mcmc(
+    image, 
+    psf=None, 
+    reg=None,
+    n_iter=100,
+    burn_in=20,
+    clip=True, 
+    eps=1e-12, 
+    psf_size=15, 
+    psf_sigma=5
+):
     """
-    Improved unsupervised Wiener filter for grayscale or RGB images using Gibbs sampler.
-    Sử dụng các hàm _pad_to_shape, _laplacian_ir, và gaussian_psf cho PSF và Regularization.
+    Wiener deconvolution không giám sát sử dụng MCMC (Gibbs Sampler)
+    để ước tính các siêu tham số.
+
+    Hàm này thay thế việc truyền vào 'balance' cố định bằng cách
+    tự động lấy mẫu các tham số precision (gamma_epsilon, gamma_1)
+    dựa trên Mục 5.B của bài báo.
+
+    Parameters
+    ----------
+    image : ndarray
+        Ảnh đầu vào (real-valued).
+    psf : ndarray or None
+        Point Spread Function. Nếu None -> Gaussian.
+    reg : ndarray or None
+        Toán tử regularization (mặc định Laplacian).
+    n_iter : int
+        Tổng số lần lặp MCMC.
+    burn_in : int
+        Số lần lặp ban đầu để loại bỏ (giai đoạn 'cháy').
+    clip : bool
+        Nếu True, giới hạn output về [-1, 1].
+    eps : float
+        Giá trị nhỏ tránh chia cho 0.
     
-    Lưu ý: Hàm này được đơn giản hóa cho ảnh 2D (grayscale). Phần xử lý RGB đã được gỡ bỏ để 
-    tập trung vào logic cốt lõi.
-
-    Input:
-        image: Grayscale (2D) float array [0,1]
-        psf_sigma_init: Initial sigma for Gaussian PSF (float)
-        reg_tf: Regularization transfer function (ndarray, optional; default Laplacian TF)
-        user_params: Dict with 'threshold' (1e-4), 'burnin' (15), 'min_num_iter' (30), 'max_num_iter' (200)
-        clip: Clip output to [0,1]
-        rng: np.random.Generator (optional)
-    Output:
-        deconvolved: Restored image (same shape as input)
-        psf: Estimated PSF (2D array)
+    Returns
+    -------
+    ndarray : ảnh khôi phục (cùng shape với input)
     """
-    # Defaults
-    if user_params is None:
-        user_params = {'threshold': 1e-4, 'burnin': 15, 'min_num_iter': 30, 'max_num_iter': 200}
-    if rng is None:
-        rng = np.random.default_rng()
-
-    image = np.asarray(image, dtype=np.float64)
-    if image.ndim != 2:
-         raise ValueError("Chỉ chấp nhận ảnh grayscale 2D cho phiên bản này.")
     
-    # Normalize image to [0,1]
-    if image.max() > 1.0:
-        image /= 255.0
+    # 1. CHUẨN HÓA ẢNH (QUAN TRỌNG NHẤT)
+    # Đưa ảnh về khoảng [0, 1] để tránh residual quá lớn làm sập gamma_e
+    img_min = image.min()
+    img_max = image.max()
+    if img_max - img_min > eps:
+        image_norm = (image - img_min) / (img_max - img_min)
+    else:
+        image_norm = image.copy()
 
-    # Shapes
-    shape = image.shape
-    ndim = image.ndim
-    N = shape[0] * shape[1]
+    image_norm = np.asarray(image_norm, dtype=np.float64)
+    ndim = image_norm.ndim
+    shape = image_norm.shape
+    N = image_norm.size
 
-    # --- Chuẩn bị Regularization Transfer Function (Lambda_D^2) ---
-    if reg_tf is None:
-        # 1. Sinh Laplacian IR (kích thước 3x3)
-        reg_ir = _laplacian_ir(ndim)
-        # 2. Đệm và shift IR về kích thước ảnh
-        reg_padded = _pad_to_shape(reg_ir, shape)
-        # 3. FFT và tính bình phương độ lớn (Lambda_D^2)
-        reg_tf = np.abs(fft2(reg_padded))**2
-    
-    # Gán lại cho reg để dùng trong công thức (dùng reg_tf để rõ ràng)
-    reg = reg_tf
+    # --- Khởi tạo ---
+    # PSF mặc định = Gaussian kernel
+    if psf is None:
+        psf = gaussian_psf(psf_size, psf_sigma, ndim)
 
-    # --- Khởi tạo PSF và Transfer Function (Lambda_H) ---
-    psf_size = 5 # Kích thước kernel Gaussian mặc định
-    sigma_psf = psf_sigma_init
-    
-    psf_ir = gaussian_psf(psf_size, sigma_psf, ndim)
-    Lambda_H = fft2(_pad_to_shape(psf_ir, shape))
-
-    # Initial values
-    ft_img = fft2(image)
-    gamma_eps = N / (np.linalg.norm(ft_img)**2 + 1e-10) # Khởi tạo gamma_eps
-    gamma_1 = 1.0
-    ft_x = np.copy(ft_img)
-
-    # Gibbs sampling
-    x_samples = []
-    prev_mean = np.zeros(shape, dtype=complex)
-    k = 0
-    converged = False
-    
-    while not converged and k < user_params['max_num_iter']:
-        # Step 1: Sample image ft_x^(k+1)
-        abs_Lambda_H_sq = np.abs(Lambda_H)**2
-        
-        # Sigma_inv = gamma_eps * |Lambda_H|^2 + gamma_1 * |Lambda_D|^2 (Eq. 28)
-        Sigma_inv = gamma_eps * abs_Lambda_H_sq + gamma_1 * reg 
-        
-        Sigma = 1 / (Sigma_inv + 1e-10) # Inverse of precision matrix (covariance)
-        
-        # mu = gamma_eps * Sigma * Lambda_H^* * ft_img (Eq. 30 - Wiener-Hunt Filter)
-        mu = gamma_eps * Sigma * np.conj(Lambda_H) * ft_img
-        
-        # Sampling complex Gaussian (Eq. 27). Chia cho sqrt(2) vì đây là Complex Gaussian
-        eta_real = rng.normal(0, 1, shape)
-        eta_imag = rng.normal(0, 1, shape)
-        eta = eta_real + 1j * eta_imag
-        ft_x = mu + np.sqrt(Sigma) * eta / np.sqrt(2)
-
-        # Step 2: Sample gamma_eps (Jeffreys' prior: alpha_eps = N/2, beta_eps = 2 / ||y-Hx||^2)
-        residual = ft_img - Lambda_H * ft_x
-        beta_eps_inv = np.linalg.norm(residual)**2 / 2
-        alpha_eps = N / 2
-        gamma_eps = rng.gamma(alpha_eps, 1 / (beta_eps_inv + 1e-10))
-
-        # Step 3: Sample gamma_1 (Jeffreys' prior: alpha_1 = (N-1)/2, beta_1 = 2 / ||Dx||^2)
-        dx_sq = reg * np.abs(ft_x)**2
-        beta_1_inv = np.sum(dx_sq) / 2
-        alpha_1 = (N - 1) / 2
-        gamma_1 = rng.gamma(alpha_1, 1 / (beta_1_inv + 1e-10))
-
-        # Step 4: Sample PSF sigma via Metropolis-Hastings (Independent MH with Uniform prior for sigma)
-        
-        # Đề xuất sigma mới (ví dụ: Uniform [0.1, 10.0])
-        sigma_range = 10.0
-        sigma_p = 0.1 + rng.random() * (sigma_range - 0.1) 
-        
-        # Tính Transfer Function mới
-        psf_ir_p = gaussian_psf(psf_size, sigma_p, ndim)
-        Lambda_H_p = fft2(_pad_to_shape(psf_ir_p, shape))
-        
-        # Tiêu chí chấp nhận J (Eq. 42)
-        resid_old = ft_img - Lambda_H * ft_x
-        resid_p = ft_img - Lambda_H_p * ft_x
-        J = (gamma_eps / 2) * (np.linalg.norm(resid_old)**2 - np.linalg.norm(resid_p)**2)
-        
-        if np.log(rng.random()) < min(J, 0):
-            sigma_psf = sigma_p
-            Lambda_H = Lambda_H_p
-
-        # Collect samples
-        k += 1
-        if k > user_params['burnin']:
-            x_samples.append(ft_x)
-            if len(x_samples) >= user_params['min_num_iter']:
-                current_mean = np.mean(x_samples, axis=0)
-                rel_change = np.linalg.norm(current_mean - prev_mean) / (np.linalg.norm(current_mean) + 1e-10)
-                if rel_change < user_params['threshold']:
-                    converged = True
-                prev_mean = current_mean
-
-    # Final deconvolved (Posterior Mean)
-    if not x_samples:
-        x_samples = [ft_x]
-    ft_mean = np.mean(x_samples, axis=0)
-    deconvolved = np.real(ifft2(ft_mean))
-    if clip:
-        deconvolved = np.clip(deconvolved, 0, 1)
-
-    # Estimated PSF
-    estimated_psf_ir = gaussian_psf(psf_size, sigma_psf, ndim)
-    estimated_psf = _pad_to_shape(estimated_psf_ir, shape) # Trả về PSF kích thước ảnh
-
-    return deconvolved, estimated_psf
-
-
-# Generate Gaussian PSF with correct centering
-def get_psf_sigma(sigma, shape):
-    x = np.arange(-shape[0]//2, shape[0]//2)
-    y = np.arange(-shape[1]//2, shape[1]//2)
-    X, Y = np.meshgrid(x, y, indexing='ij')  # Correct order: x, y
-    psf = np.exp(-(X**2 + Y**2) / (2 * sigma**2))
-    psf /= psf.sum()
-    return fftshift(psf)  # Center the PSF
-
-# Wiener filter cơ bản
-def wiener_base(img, kernel, K=0.01):
-    """
-    img: Ảnh bị mờ (2D array, float [0,1])
-    kernel: Kernel mờ (2D array, float) - Dự đoán
-    K: Hằng số ổn định (float, thường nhỏ, ví dụ 0.01)
-    """
-    kernel = kernel / np.sum(kernel)
-    dummy = np.copy(img)
-    dummy = fft2(dummy)
-    kernel = fft2(kernel, s=img.shape)
-    kernel = np.conj(kernel) / (np.abs(kernel)**2 + K)
-    dummy = dummy * kernel
-    dummy = np.real(ifft2(dummy))
-    return dummy
-
-
-def unsupervised_wiener_improved(image, psf_init=1, reg=None, user_params=None, clip=True, rng=None):
-    """
-    Improved unsupervised Wiener filter for grayscale or RGB images using Gibbs sampler.
-    Fixes quadrant swap and 180-degree flip issues by centering PSF and correct meshgrid indexing.
-    Input:
-        image: Grayscale (2D) or RGB (3D) float array [0,1]
-        psf_init: Initial sigma for Gaussian PSF (float)
-        reg: Regularization transfer function (ndarray, optional; default Laplacian)
-        user_params: Dict with 'threshold' (1e-4), 'burnin' (15), 'min_num_iter' (30), 'max_num_iter' (200)
-        clip: Clip output to [0,1]
-        rng: np.random.Generator (optional)
-    Output:
-        deconvolved: Restored image (same shape as input)
-        psf: Estimated PSF (2D array)
-    """
-    # Defaults
-    if user_params is None:
-        user_params = {'threshold': 1e-4, 'burnin': 15, 'min_num_iter': 30, 'max_num_iter': 200}
-    if rng is None:
-        rng = np.random.default_rng()
-
-    # Check if image is RGB (3D) or grayscale (2D)
-    image = np.asarray(image, dtype=float)
-    is_rgb = len(image.shape) == 3 and image.shape[-1] == 3
-    if is_rgb:
-        restored_img = np.zeros_like(image)
-        psf_final = None
-        for c in range(3):
-            restored_img[..., c], psf = unsupervised_wiener_improved(
-                image[..., c], psf_init, reg, user_params, clip, rng
-            )
-            if c == 0:  # Store PSF from first channel (assume same for all)
-                psf_final = psf
-        return restored_img, psf_final
-
-    # Normalize image to [0,1]
-    if image.max() > 1.0:
-        image /= 255.0
-
-    # Shapes
-    shape = image.shape
-    N = shape[0] * shape[1]
-
-    # Fourier grid for Laplacian regularization
+    # Regularization mặc định = Laplacian [cite: 348]
     if reg is None:
-        fx = fftfreq(shape[0])
-        fy = fftfreq(shape[1])
-        FX, FY = np.meshgrid(fx, fy, indexing='ij')
-        reg = 2 * (2 - np.cos(2 * np.pi * FX) - np.cos(2 * np.pi * FY))
+        reg = _laplacian_ir(ndim)
 
-    psf = get_psf_sigma(psf_init, shape)
-    Lambda_H = fft2(psf)  # PSF transfer function
+    # Chuyển đổi sang miền Fourier
+    H = rfftn(_pad_to_shape(psf, shape))
+    D = rfftn(_pad_to_shape(reg, shape))
+    Y = rfftn(image_norm)
 
-    # Initial values
-    gamma_eps = N / np.linalg.norm(fft2(image))**2
-    gamma_1 = 1.0
-    sigma_psf = psf_init
-    ft_img = fft2(image)
-    ft_x = np.copy(ft_img)
+    # Các thành phần tiền tính toán
+    H_conj = np.conj(H)
+    H_abs_sq = np.abs(H)**2
+    D_abs_sq = np.abs(D)**2
 
-    # Gibbs sampling
-    x_samples = []
-    prev_mean = np.zeros(shape, dtype=complex)
-    k = 0
-    converged = False
-    while not converged and k < user_params['max_num_iter']:
-        # Step 1: Sample image circ x^(k+1)
-        abs_Lambda_H_sq = np.abs(Lambda_H)**2
-        Sigma_inv = gamma_eps * abs_Lambda_H_sq + gamma_1 * reg
-        Sigma = 1 / (Sigma_inv + 1e-10)
-        mu = gamma_eps * Sigma * np.conj(Lambda_H) * ft_img
-        eta_real = rng.normal(0, 1, shape)
-        eta_imag = rng.normal(0, 1, shape)
-        eta = eta_real + 1j * eta_imag
-        ft_x = mu + np.sqrt(Sigma) * eta / np.sqrt(2)
+    # Khởi tạo các siêu tham số (precision)
+    gamma_epsilon = 1.0 / (np.var(image_norm) * 0.01 + eps) # Giả định nhiễu thấp ban đầu
+    gamma_1 = 1.0 / np.var(image_norm)
 
-        # Step 2: Sample gamma_eps
-        residual = ft_img - Lambda_H * ft_x
-        beta_eps = np.linalg.norm(residual)**2 / 2
-        alpha_eps = N / 2
-        gamma_eps = rng.gamma(alpha_eps, 1 / beta_eps) if beta_eps > 0 else 1e-6
+    alpha0_eps, beta0_eps = 1e-2, 1e-2
+    alpha0_1, beta0_1 = 1e-2, 1e-2
+    GAMMA_MIN, GAMMA_MAX = 0.031, 1e2
 
-        # Step 3: Sample gamma_1
-        dx = reg * np.abs(ft_x)**2
-        beta_1 = np.sum(dx) / 2
-        alpha_1 = (N - 1) / 2
-        gamma_1 = rng.gamma(alpha_1, 1 / beta_1) if beta_1 > 0 else 1e-6
+    # Khởi tạo ảnh phục hồi (X_fft)
+    # Bắt đầu bằng chính ảnh mờ
+    X_fft = Y.copy()
 
-        # Step 4: Sample PSF sigma via Metropolis-Hastings
-        sigma_p = 0.1 + rng.random() * 9.9
-        psf_p = get_psf_sigma(sigma_p, shape)
-        Lambda_H_p = fft2(psf_p)
-        resid_old = ft_img - Lambda_H * ft_x
-        resid_p = ft_img - Lambda_H_p * ft_x
-        J = (gamma_eps / 2) * (np.linalg.norm(resid_old)**2 - np.linalg.norm(resid_p)**2)
-        if np.log(rng.random()) < min(J, 0):
-            sigma_psf = sigma_p
-            Lambda_H = Lambda_H_p
+    # Biến để lưu trữ tổng các mẫu (để lấy trung bình)
+    X_samples_sum = np.zeros_like(Y, dtype=complex)
+    samples_count = 0
+    
+    print(f"Bắt đầu MCMC với {n_iter} lần lặp (burn-in: {burn_in})...")
 
-        # Collect samples
-        k += 1
-        if k > user_params['burnin']:
-            x_samples.append(ft_x)
-            if len(x_samples) >= user_params['min_num_iter']:
-                current_mean = np.mean(x_samples, axis=0)
-                rel_change = np.linalg.norm(current_mean - prev_mean) / np.linalg.norm(current_mean)
-                if rel_change < user_params['threshold']:
-                    converged = True
-                prev_mean = current_mean
+    # --- Vòng lặp MCMC (Gibbs Sampler) ---
+    for k in range(n_iter):
+        
+        # 1. LẤY MẪU ẢNH (Mục 5.A)
+        # ---------------------------
+        # Tính toán bộ lọc Wiener-Hunt dựa trên các tham số gamma hiện tại
+        # Đây chính là phần lõi của hàm wiener_base_real cũ
+        
+        # balance = gamma_1 / gamma_epsilon
+        # W = H_conj / (H_abs_sq + balance * D_abs_sq)
+        
+        # Thay vì tính 'balance', ta dùng công thức gốc từ Mục 5.A:
+        # mu = gamma_e * (gamma_e * |H|^2 + gamma_1 * |D|^2)^-1 * H_conj * Y
+        # X_fft = mu 
+        # (Đây là ước tính MAP/Mean, không phải mẫu đầy đủ, nhưng phổ biến)
 
-    # Final deconvolved
-    if not x_samples:
-        x_samples = [ft_x]
-    ft_mean = np.mean(x_samples, axis=0)
-    deconvolved = np.real(ifft2(ft_mean))
+        inv_sigma_fft = gamma_epsilon * H_abs_sq + gamma_1 * D_abs_sq
+        sigma_fft = 1.0 / np.where(inv_sigma_fft < eps, eps, inv_sigma_fft)
+
+        mu_fft = gamma_epsilon * sigma_fft * H_conj * Y
+
+        # Thay vì X_fft = mu, ta cần X ~ N(mu, sigma)
+        # Trong miền tần số: X = mu + sqrt(sigma) * noise
+        # Noise phức chuẩn tắc
+        noise_real = np.random.standard_normal(X_fft.shape)
+        noise_imag = np.random.standard_normal(X_fft.shape)
+        complex_noise = (noise_real + 1j * noise_imag)
+        
+        # Tính trung bình hậu nghiệm mu
+        # X_fft = gamma_epsilon * sigma_fft * H_conj * Y
+        X_fft = mu_fft + np.sqrt(sigma_fft) * complex_noise * 0.5 
+        
+        
+        # 2. LẤY MẪU CÁC THAM SỐ PRECISION (Mục 5.B)
+        # ---------------------------------------------
+        # Sử dụng Jeffreys' prior (alpha=0, beta_inv=0)
+        
+        # A. Lấy mẫu gamma_epsilon (Noise precision)
+        # alpha_eps = N / 2.0
+        # residual_sq_sum = np.sum(np.abs(Y - H * X_fft)**2)
+        # beta_eps = 2.0 / np.where(residual_sq_sum < eps, eps, residual_sq_sum)
+        # gamma_epsilon = sample_gamma(alpha_eps, beta_eps)
+        alpha_eps = alpha0_eps + N / 2.0
+        residual_sq_sum = np.sum(np.abs(Y - H * X_fft)**2)
+        beta_eps = beta0_eps + residual_sq_sum / 2.0
+        gamma_epsilon = np.clip(sample_gamma(alpha_eps, 1.0/beta_eps), GAMMA_MIN, GAMMA_MAX)
+        
+        # B. Lấy mẫu gamma_1 (Image/Regularization precision)
+        # alpha_1 = (N - 1) / 2.0 # (Bỏ qua 1 bậc tự do của gamma_0)
+        # reg_sq_sum = np.sum(np.abs(D * X_fft)**2)
+        # beta_1 = 2.0 / np.where(reg_sq_sum < eps, eps, reg_sq_sum)
+        # gamma_1 = sample_gamma(alpha_1, beta_1)
+        alpha_1 = alpha0_1 + (N - 1) / 2.0
+        reg_sq_sum = np.sum(np.abs(D * X_fft)**2)
+        beta_1 = beta0_1 + reg_sq_sum / 2.0
+        gamma_1 = np.clip(sample_gamma(alpha_1, 1.0/beta_1), GAMMA_MIN, GAMMA_MAX)
+
+        # 3. LƯU TRỮ MẪU (SAU KHI BURN-IN)
+        # ---------------------------------
+        if k >= burn_in:
+            X_samples_sum += mu_fft
+            samples_count += 1
+            
+        if (k + 1) % 10 == 0:
+            balance = gamma_1 / (gamma_epsilon + eps)
+            print(f" Iter {k+1}: ge={gamma_epsilon:.3f}, g1={gamma_1:.3f}, bal={balance:.4f}, Res={residual_sq_sum:.4f}")
+
+    # --- HOÀN TẤT ---
+    # Tính toán ước tính cuối cùng bằng trung bình các mẫu
+    # Đây là ước tính trung bình hậu nghiệm (posterior mean)
+    if samples_count == 0:
+        print("Cảnh báo: Không có mẫu nào được thu thập (burn_in >= n_iter)")
+        X_mean_fft = X_fft # Trả về mẫu cuối cùng
+    else:
+        X_mean_fft = X_samples_sum / samples_count
+    
+    X_final = irfftn(X_mean_fft, s=shape)
+    
+    # 4. KHÔI PHỤC SCALE GỐC (DENORMALIZE)
+    if img_max - img_min > eps:
+        X_final = X_final * (img_max - img_min) + img_min
+        
     if clip:
-        deconvolved = np.clip(deconvolved, 0, 1)
+        # Clip theo giá trị gốc của ảnh đầu vào (ví dụ 0-255) hoặc -1,1 tuỳ input
+        # Ở đây clip theo min/max ban đầu của ảnh
+        X_final = np.clip(X_final, image.min(), image.max())
 
-    # Estimated PSF
-    estimated_psf = get_psf_sigma(sigma_psf, shape)
-
-    return deconvolved, estimated_psf
-
-
-
-# Helper function to pad kernel to a given shape and compute FFT
-def fft_pad(kernel, shape):
-    pad_y = shape[0] - kernel.shape[0]
-    pad_x = shape[1] - kernel.shape[1]
-    pad_top = pad_y // 2
-    pad_bottom = pad_y - pad_top
-    pad_left = pad_x // 2
-    pad_right = pad_x - pad_left
-    padded = np.pad(kernel, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
-    return np.fft.fft2(padded)
-
-# Compute |D|^2 in frequency domain (D is gradient operator)
-def get_D_power(shape):
-    # Horizontal gradient kernel [1, -1]
-    dx = np.array([[1, -1]])
-    # Vertical gradient kernel [1; -1]
-    dy = np.array([[1], [-1]])
-    Dx = fft_pad(dx, shape)
-    Dy = fft_pad(dy, shape)
-    return np.abs(Dx)**2 + np.abs(Dy)**2
-
-# Learn restoration filter w1 using FD closed-form and crop to spatial domain
-def learn_restoration_filter(h, gamma, s, fft_shape=(256, 256)):
-    H = fft_pad(h, fft_shape)
-    D2 = get_D_power(fft_shape)
-    # Wiener-like filter in FD
-    W = np.conj(H) / (np.abs(H)**2 + (1 / gamma) * D2 + 1e-10)  # Small epsilon to avoid division issues
-    w_fd = np.fft.ifft2(W).real
-    # Crop center to s x s
-    half = s // 2
-    center_y, center_x = fft_shape[0] // 2, fft_shape[1] // 2
-    w_crop = w_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
-    # Adjust to preserve sum (DC component)
-    current_sum = np.sum(w_crop)
-    desired_sum = np.real(W[0, 0])
-    add = (desired_sum - current_sum) / (s * s)
-    w1 = w_crop + add
-    return w1
-
-# Learn update filters w2x and w2y using FD closed-form and crop to spatial domain
-def learn_update_filters(h, gamma, beta, s, fft_shape=(256, 256)):
-    H = fft_pad(h, fft_shape)
-    D2 = get_D_power(fft_shape)
-    denom = D2 + (gamma / beta) * np.abs(H)**2 + 1e-10  # Small epsilon
-    # Horizontal
-    dx = np.array([[1, -1]])
-    Dx = fft_pad(dx, fft_shape)
-    Wx = np.conj(Dx) / denom
-    wx_fd = np.fft.ifft2(Wx).real
-    half = s // 2
-    center_y, center_x = fft_shape[0] // 2, fft_shape[1] // 2
-    wx_crop = wx_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
-    current_sum_x = np.sum(wx_crop)
-    desired_sum_x = np.real(Wx[0, 0])
-    add_x = (desired_sum_x - current_sum_x) / (s * s)
-    wx = wx_crop + add_x
-    # Vertical
-    dy = np.array([[1], [-1]])
-    Dy = fft_pad(dy, fft_shape)
-    Wy = np.conj(Dy) / denom
-    wy_fd = np.fft.ifft2(Wy).real
-    wy_crop = wy_fd[center_y - half:center_y + half + 1, center_x - half:center_x + half + 1]
-    current_sum_y = np.sum(wy_crop)
-    desired_sum_y = np.real(Wy[0, 0])
-    add_y = (desired_sum_y - current_sum_y) / (s * s)
-    wy = wy_crop + add_y
-    return wx, wy
-
-# Compute image gradients (Du)
-def compute_gradient(u):
-    dx = np.array([[1, -1]])
-    dy = np.array([[1], [-1]])
-    ux = convolve2d(u, dx, mode='same')
-    uy = convolve2d(u, dy, mode='same')
-    return ux, uy
-
-# Iterative Wiener Filtering and Thresholding (IWFT) - Algorithm 2
-def iwft(g, gamma, h=None, beta=None, s=15, N=15, tol=1e-4, fft_shape=(256, 256)):
-
-    if h is None:
-        h = np.ones((5, 5)) / 25.0  
-    # Learn filters
-    w1 = learn_restoration_filter(h, gamma, s, fft_shape)
-    wx, wy = learn_update_filters(h, gamma, beta if beta else 10 * np.max(g), s, fft_shape)
-    
-    # Initial estimation
-    u1 = convolve2d(g, w1, mode='same')
-    u = u1.copy()
-    
-    # Default beta if not provided
-    if beta is None:
-        beta = 10 * np.max(g)
-    
-    # Initialize a (Lagrange multiplier, 2 channels)
-    ax = np.zeros_like(g)
-    ay = np.zeros_like(g)
-    
-    k = N
-    while k > 0:
-        u_old = u.copy()
-        
-        # Compute Du
-        ux, uy = compute_gradient(u)
-        
-        # Compute norm ||Du - a||_2
-        diff_x = ux - ax
-        diff_y = uy - ay
-        norm2 = np.sqrt(diff_x**2 + diff_y**2)
-        
-        # Soft thresholding
-        thresh = np.maximum(norm2 - 1 / beta, 0)
-        denom = norm2 + 1e-10  # Avoid division by zero
-        vx = diff_x * (thresh / denom)
-        vy = diff_y * (thresh / denom)
-        
-        # Update a
-        ax = ax - ux + vx
-        ay = ay - uy + vy
-        
-        # Update u
-        update_x = convolve2d(vx + ax, wx, mode='same')
-        update_y = convolve2d(vy + ay, wy, mode='same')
-        u = u1 + update_x + update_y
-        
-        # Check relative tolerance
-        rel_change = np.linalg.norm(u - u_old) / (np.linalg.norm(u_old) + 1e-10)
-        if rel_change < tol:
-            break
-        
-        k -= 1
-    
-    return u
+    return X_final

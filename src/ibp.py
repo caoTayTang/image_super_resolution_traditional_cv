@@ -48,7 +48,7 @@ def iterative_backprojection(
 
     # --- 3️⃣ Vòng lặp IBP ---
     for it in range(iterations):
-        print(f"\r[IBP] Iteration {it+1}/{iterations}", end="", flush=True)
+        print(f"[IBP] Iteration {it+1}/{iterations}")
         
         # (a) Mô phỏng ảnh LR từ HR
         sim_lr = simulate_lr_from_hr(x, scale, kernel)
