@@ -5,7 +5,7 @@ import gradio as gr
 
 # Giả sử bạn đã có file này
 # from src import sr_interpolation
-from src.models import iterative_backprojection
+from src.ibp import iterative_backprojection
 
 # Vì mình không có file src của bạn, mình tạo hàm dummy để code chạy được demo
 # Bạn nhớ xóa 2 hàm dummy này khi chạy thật nhé
