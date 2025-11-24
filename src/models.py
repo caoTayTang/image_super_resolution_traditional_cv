@@ -6,6 +6,7 @@ from modules.upsample import upsample_nearest
 
 def iterative_backprojection(
     lr,
+    init_img=None,
     upsample=upsample_nearest,
     scale=4,
     iterations=20,
@@ -61,7 +62,12 @@ def iterative_backprojection(
         kernel = gaussian_kernel(size, sigma)
 
     # --- 2️⃣ Khởi tạo ảnh HR nội suy ---
-    x = upsample(lr, scale)
+    if init_img is not None:
+        x = init_img.copy()
+        print("IBP: Using provided initial image (Wiener output).")
+    else:
+        x = upsample(lr, scale)
+        print("IBP: Initializing with Upsample.")
 
     mse_list = []
     prev_err = np.inf
@@ -97,7 +103,7 @@ def iterative_backprojection(
 
         # (g) Denoise nhẹ nếu bật
         if denoise:
-            x = denoise_tv_chambolle(x, weight=0.05)
+            x = denoise_tv_chambolle(x, weight=0.02)
 
         # (h) Clip giá trị hợp lệ
         x = np.clip(x, 0, 1)
