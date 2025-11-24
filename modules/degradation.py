@@ -1,26 +1,5 @@
-# import numpy as np
-# from scipy import signal, ndimage
-
-# def gaussian_kernel(k=9, sigma=1.6):
-#     ax = np.arange(-k//2+1., k//2+1.)
-#     xx, yy = np.meshgrid(ax, ax)
-#     kernel = np.exp(-(xx**2 + yy**2) / (2. * sigma **2))
-#     return kernel / np.sum(kernel)
-    
-# def degrade_image(hr, scale=4, kernel=None, noise_std=0.01):
-#     if kernel is None:
-#         kernel = gaussian_kernel(9,1.6)
-    
-#     # Bước 1: Blur
-#     blurred = signal.convolve2d(hr, kernel, mode='same', boundary='symm')
-#     lr = blurred[::scale, ::scale]
-#     noisy = lr + np.random.normal(0, noise_std, lr.shape)
-#     noisy = np.clip(noisy, 0, 1)
-#     return noisy
-    
 import cv2
 import numpy as np
-from scipy import signal
 
 def gaussian_kernel(size=9, sigma=1.6):
     ax = np.linspace(-(size // 2), size // 2, size)
@@ -28,24 +7,32 @@ def gaussian_kernel(size=9, sigma=1.6):
     kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
     return kernel / np.sum(kernel)
 
+def blur(image, kernel):
+    """
+    Hàm làm mờ hỗ trợ cả ảnh xám và ảnh màu.
+    Dùng cv2.filter2D để thay thế vòng lặp for (nhanh hơn rất nhiều).
+    """
+    # cv2.filter2D tự động xử lý từng kênh màu nếu là ảnh màu
+    return cv2.filter2D(image, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+def simulate_lr_from_hr(hr_est, scale, kernel):
+    """Mô phỏng LR từ HR: Blur + Downsample (làm thủ công)."""
+    # Bước 1: Blur
+    blurred = blur(hr_est, kernel)
+    # Bước 2: Downsample
+    lr = blurred[::scale, ::scale]
+
+    return lr
 
 def degrade_image(hr, scale=4, kernel=None, noise_type="gaussian", noise_std=0.01):
     if kernel is None:
         kernel = gaussian_kernel(9, 1.6)
 
-    # Handle both grayscale and color images
-    if hr.ndim == 2:  # Grayscale image
-        # Blur
-        hr_blur = signal.convolve2d(hr, kernel, mode="same", boundary="symm")
-        # Downsample
-        lr = hr_blur[::scale, ::scale]
-    else:  # Color image (3D)
-        hr_blur = np.zeros_like(hr)
-        # Apply blur to each channel separately
-        for c in range(hr.shape[2]):
-            hr_blur[:, :, c] = signal.convolve2d(hr[:, :, c], kernel, mode="same", boundary="symm")
-        # Downsample
-        lr = hr_blur[::scale, ::scale, :]
+    # Blur
+    hr_blur = blur(hr, kernel)
+
+    # Downsample
+    lr = hr_blur[::scale, ::scale]
 
     # Add noise
     if noise_type == "gaussian":
