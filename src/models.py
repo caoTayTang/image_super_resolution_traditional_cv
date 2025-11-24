@@ -1,6 +1,5 @@
 import numpy as np
-from modules.degradation.degrade import gaussian_kernel
-from modules.degradation.downsample import blur, simulate_lr_from_hr
+from modules.degradation import *
 from modules.upsample import upsample_bicubic
 
 def iterative_backprojection(
@@ -20,7 +19,7 @@ def iterative_backprojection(
     flipped_kernel = np.flipud(np.fliplr(kernel))
 
     for it in range(iterations):
-        print(f"\r[IBP] Iteration {it+1}/{iterations}", end="", flush=True)
+        print(f"[IBP] Iteration {it+1}/{iterations}")
 
         # (a) Mô phỏng ảnh LR từ HR
         sim_lr = simulate_lr_from_hr(x, scale, kernel)

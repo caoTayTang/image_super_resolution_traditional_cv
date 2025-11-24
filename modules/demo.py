@@ -150,8 +150,8 @@ def run_gradio():
                         value="bicubic",
                         label="Upsample Method (IBP Post-process)"
                     )
-                    ibp_iter = gr.Slider(1, 200, value=20, step=1, label="IBP Iterations")
-                    ibp_alpha = gr.Slider(0.1, 2.0, value=0.5, step=0.1, label="IBP Step Size α")
+                    ibp_iter = gr.Slider(10, 200, value=20, step=1, label="IBP Iterations")
+                    ibp_alpha = gr.Slider(0.1, 1.0, value=0.2, step=0.1, label="IBP Step Size α")
 
                 btn = gr.Button("Run SR", variant="primary")
 
