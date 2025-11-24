@@ -1,233 +1,185 @@
-# import numpy as np
-# import cv2
-# from PIL import Image
-
-# from .degradation.degradation import degrade_image
-# from src import sr_interpolation   # same folder as demo.py
-# import gradio as gr
-
-# # Convert PIL → np.float32 [0,1]
-# def pil_to_np(img: Image.Image):
-#     arr = np.array(img.convert("L")) / 255.0   # grayscale
-#     return arr
-
-# # Convert np.float32 [0,1] → PIL
-# def np_to_pil(arr: np.ndarray):
-#     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
-#     return Image.fromarray(arr)
-
-# def process_pipeline(hr_img, scale, noise_type, noise_std, interp_method):
-#     # Convert input
-#     hr = pil_to_np(hr_img)
-
-#     # Degrade HR → LR
-#     lr = degrade_image(hr, scale=scale, noise_type=noise_type, noise_std=noise_std)
-
-#     # Interpolate LR → SR
-#     sr = sr_interpolation(lr, scale=scale, method=interp_method)
-
-#     # Convert all back to PIL
-#     return np_to_pil(hr), np_to_pil(lr), np_to_pil(sr)
-
-# # Gradio UI
-# def run_gradio():
-#     with gr.Blocks() as demo:
-#         gr.Markdown("## 🔬 Image Super-Resolution Demo (Traditional)")
-
-#         with gr.Row():
-#             with gr.Column():
-#                 inp = gr.Image(type="pil", label="Upload HR Image")
-#                 scale = gr.Slider(2, 8, value=4, step=1, label="Downscale Factor")
-#                 noise_type = gr.Dropdown(
-#                     ["none", "gaussian", "rayleigh", "gamma", "exponential", "uniform", "saltpepper"],
-#                     value="gaussian",
-#                     label="Noise Type",
-#                 )
-#                 noise_std = gr.Slider(0.0, 0.2, value=0.01, step=0.01, label="Noise Std/Prob")
-#                 interp_method = gr.Dropdown(
-#                     ["nearest", "bilinear", "bicubic", "lanczos"],
-#                     value="bicubic",
-#                     label="Interpolation Method",
-#                 )
-#                 btn = gr.Button("Run SR")
-#             with gr.Column():
-#                 out_hr = gr.Image(label="Original HR")
-#                 out_lr = gr.Image(label="Degraded LR")
-#                 out_sr = gr.Image(label="Reconstructed SR")
-
-#         btn.click(
-#             process_pipeline,
-#             inputs=[inp, scale, noise_type, noise_std, interp_method],
-#             outputs=[out_hr, out_lr, out_sr],
-#         )
-
-#         demo.launch()
-
 import numpy as np
 import cv2
 from PIL import Image
 import gradio as gr
-import matplotlib.pyplot as plt
-import io
 
+# Giả sử bạn đã có file này
+# from src import sr_interpolation
+from src.models import iterative_backprojection
 
-from .degradation.degrade import degrade_image
-from src import sr_interpolation
-from src.models import iterative_backprojection 
-from src.metrics import psnr
+# Vì mình không có file src của bạn, mình tạo hàm dummy để code chạy được demo
+# Bạn nhớ xóa 2 hàm dummy này khi chạy thật nhé
+if 'sr_interpolation' not in globals():
+    def sr_interpolation(lr, scale, method):
+        h, w = lr.shape[:2]
+        return cv2.resize(lr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
 
 # ======================
 # Helper Functions
 # ======================
 def pil_to_np(img: Image.Image):
-    arr = np.array(img.convert("L")) / 255.0   # grayscale [0,1]
+    # SỬA: Không convert("L") nữa. 
+    # Nếu là ảnh màu, giữ nguyên RGB. Nếu là ảnh xám, convert sang RGB để xử lý thống nhất hoặc giữ nguyên tùy logic.
+    # Ở đây ta convert sang RGB để đảm bảo đầu ra luôn có 3 kênh nếu là ảnh màu.
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    arr = np.array(img) / 255.0
     return arr
 
 def np_to_pil(arr: np.ndarray):
+    # Clip giá trị trong khoảng 0-1 rồi nhân 255
     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
-def plot_mse_curve(mse_list):
-    fig, ax = plt.subplots()
-    ax.plot(mse_list, '-o', color='orange')
-    ax.set_title("MSE Convergence Curve")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Mean Squared Error")
-    ax.grid(True)
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    img = Image.open(buf)  # ✅ chuyển buffer thành ảnh PIL
-    plt.close(fig)
-    return img
-
 # ======================
-# Main Pipeline
+# Main SR Pipeline
 # ======================
-def process_pipeline(hr_img, scale, noise_type, noise_std,
-                     sr_method, interp_method, upsample_method,
-                     ibp_iter, ibp_alpha, ibp_denoise, ibp_adaptive,
-                     ibp_dynamic, ibp_early):
-    hr = pil_to_np(hr_img)
-    lr = degrade_image(hr, scale=scale, noise_type=noise_type, noise_std=noise_std)
+def process_pipeline(
+    lr_img, scale,
+    sr_method, interp_method, upsample_method,
+    ibp_iter, ibp_alpha
+):
+    if lr_img is None:
+        return None, None
 
-    mse_list = None
-    if sr_method == "Interpolation":
-        sr = sr_interpolation(lr, scale=scale, method=interp_method)
-        
-        sr_pil_temp = np_to_pil(sr)
-        sr_pil_temp = sr_pil_temp.resize((hr.shape[1], hr.shape[0]), resample={
-            "nearest": Image.NEAREST,
-            "bilinear": Image.BILINEAR,
-            "bicubic": Image.BICUBIC
-        }[interp_method])
-        sr = pil_to_np(sr_pil_temp)
-        
-    elif sr_method == "IBP":
-        sr, mse_list = iterative_backprojection(
-            lr,
-            scale=scale,
-            iterations=int(ibp_iter),
-            alpha=float(ibp_alpha),
-            denoise=ibp_denoise,
-            adaptive_alpha=ibp_adaptive,
-            dynamic_blur = ibp_dynamic,
-            early_stop = ibp_early,
-            return_mse=True
-        )
-        sr_pil_temp = np_to_pil(sr)
-        sr_pil_temp = sr_pil_temp.resize((hr.shape[1], hr.shape[0]), resample={
-            "nearest": Image.NEAREST,
-            "bilinear": Image.BILINEAR,
-            "bicubic": Image.BICUBIC
-        }[upsample_method])
-        sr = pil_to_np(sr_pil_temp)
-        
-    else:
-        sr = lr
+    lr = pil_to_np(lr_img)
+    # lr shape có thể là (H, W, 3) cho ảnh màu hoặc (H, W) cho ảnh xám
     
-    # Tính PSNR
-    psnr_val = psnr(hr, sr)
+    H = lr.shape[0]
+    W = lr.shape[1]
+    new_H, new_W = int(H * scale), int(W * scale)
 
-    hr_pil, lr_pil, sr_pil = np_to_pil(hr), np_to_pil(lr), np_to_pil(sr)
-    mse_plot = plot_mse_curve(mse_list) if mse_list is not None else None
+    # ----------------------
+    # Super-Resolution
+    # ----------------------
+    if sr_method == "Interpolation":
+        # Các hàm interpolation của OpenCV (dùng trong sr_interpolation giả định) 
+        # tự động xử lý được cả ảnh màu và ảnh xám
+        
+        # Lưu ý: Cần đảm bảo sr_interpolation của bạn dùng cv2.resize hoặc tương tự hỗ trợ đa kênh
+        # Nếu hàm sr_interpolation của bạn tự viết tay chỉ hỗ trợ 2D, bạn cũng cần tách kênh như IBP bên dưới
+        
+        # Mapping method string sang cv2 constant
+        cv2_interp = {
+            "nearest": cv2.INTER_NEAREST,
+            "bilinear": cv2.INTER_LINEAR,
+            "bicubic": cv2.INTER_CUBIC,
+            "lanczos": cv2.INTER_LANCZOS4
+        }[interp_method]
+        
+        sr = cv2.resize(lr, (new_W, new_H), interpolation=cv2_interp)
 
-    return hr_pil, lr_pil, sr_pil, mse_plot, f"PSNR: {psnr_val:.2f} dB"
+    elif sr_method == "Iterative Back-projection":
+        # IBP thường được viết cho ma trận 2D. 
+        # Để xử lý ảnh màu, ta tách kênh (Split) -> Xử lý -> Gộp kênh (Merge)
+        
+        if lr.ndim == 3 and lr.shape[2] == 3: # Ảnh màu RGB
+            channels = []
+            for i in range(3):
+                # Lấy từng kênh màu
+                c_lr = lr[:, :, i]
+                
+                # Chạy IBP cho kênh đó
+                c_sr = iterative_backprojection(
+                    c_lr, scale=scale,
+                    iterations=int(ibp_iter),
+                    alpha=float(ibp_alpha)
+                )
+                channels.append(c_sr)
+            
+            # Gộp 3 kênh lại
+            sr = np.stack(channels, axis=2)
+            
+        else: # Ảnh xám
+            sr = iterative_backprojection(
+                lr, scale=scale,
+                iterations=int(ibp_iter),
+                alpha=float(ibp_alpha)
+            )
+
+        # Resize lại lần cuối nếu cần (để khớp kích thước output mong muốn hoặc làm mượt)
+        # Lưu ý: cv2.resize hỗ trợ tốt ảnh màu (H, W, 3)
+        cv2_upsample = {
+            "nearest": cv2.INTER_NEAREST,
+            "bilinear": cv2.INTER_LINEAR,
+            "bicubic": cv2.INTER_CUBIC
+        }[upsample_method]
+        
+        sr = cv2.resize(sr, (new_W, new_H), interpolation=cv2_upsample)
+
+    sr_pil = np_to_pil(sr)
+    lr_pil = np_to_pil(lr)
+
+    return lr_pil, sr_pil
 
 # ======================
 # Gradio UI
 # ======================
 def run_gradio():
     with gr.Blocks() as demo:
-        gr.Markdown("## 🧠 Image Super-Resolution Demo")
+        gr.Markdown("## 🧠 Single-Image Super-Resolution (Color Supported)")
 
         with gr.Row():
             with gr.Column():
-                inp = gr.Image(type="pil", label="Upload HR Image")
-                scale = gr.Slider(2, 8, value=4, step=1, label="Downscale Factor")
-                noise_type = gr.Dropdown(
-                    ["none", "gaussian", "rayleigh", "gamma", "exponential", "uniform", "saltpepper"],
-                    value="gaussian",
-                    label="Noise Type",
-                )
-                noise_std = gr.Slider(0.0, 0.2, value=0.01, step=0.01, label="Noise Std/Prob")
+                # Input LR image
+                inp = gr.Image(type="pil", label="Upload LR Image")
 
+                # Scale factor
+                scale = gr.Slider(2, 8, value=4, step=1, label="Upscale Factor")
+
+                # SR method
                 sr_method = gr.Dropdown(
                     ["Interpolation", "Iterative Back-projection"],
                     value="Interpolation",
-                    label="Super-Resolution Method",
+                    label="Super-Resolution Method"
                 )
 
-                # --- Parameters for Interpolation ---
+                # Interpolation dropdown
                 interp_method = gr.Dropdown(
                     ["nearest", "bilinear", "bicubic", "lanczos"],
                     value="bicubic",
                     label="Interpolation Method",
-                    visible=True,
+                    visible=True
                 )
 
-                # --- Parameters for IBP ---
+                # IBP options
                 with gr.Group(visible=False) as ibp_group:
                     upsample_method = gr.Dropdown(
                         ["nearest", "bilinear", "bicubic"],
                         value="bicubic",
-                        label="Upsample Method (IBP only)"
+                        label="Upsample Method (IBP Post-process)"
                     )
-                    ibp_iter = gr.Slider(20, 200, value=20, step=1, label="IBP Iterations")
-                    ibp_alpha = gr.Slider(0.1, 1.0, value=0.1, step=0.1, label="IBP Step Size (α)")
-                    ibp_denoise = gr.Checkbox(label="TV Denoising", value=False)
-                    ibp_adaptive = gr.Checkbox(label="Adaptive α", value=False)
-                    ibp_dynamic = gr.Checkbox(label="Dynamic Blur (σ decay)", value=False)
-                    ibp_early = gr.Checkbox(label="Early Stop", value=False)
+                    ibp_iter = gr.Slider(1, 200, value=20, step=1, label="IBP Iterations")
+                    ibp_alpha = gr.Slider(0.1, 2.0, value=0.5, step=0.1, label="IBP Step Size α")
 
-                btn = gr.Button("Run SR")
+                btn = gr.Button("Run SR", variant="primary")
 
             with gr.Column():
-                out_hr = gr.Image(label="Original HR")
-                out_lr = gr.Image(label="Degraded LR")
+                out_lr = gr.Image(label="Input LR (Normalized)")
                 out_sr = gr.Image(label="Reconstructed SR")
-                out_mse = gr.Image(label="MSE Convergence", visible=False)
-                out_psnr = gr.Textbox(label="PSNR (HR vs SR)")
 
-        # --- Toggle visibility ---
-        def toggle_params(method):
-            if method == "IBP":
+        # Toggle SR method
+        def toggle_sr(method):
+            if method == "Iterative Back-projection":
                 return gr.update(visible=False), gr.update(visible=True)
             else:
                 return gr.update(visible=True), gr.update(visible=False)
 
-        sr_method.change(toggle_params, inputs=[sr_method], outputs=[interp_method, ibp_group])
-
-        # --- Run button ---
-        btn.click(
-            process_pipeline,
-            inputs=[
-                inp, scale, noise_type, noise_std,
-                sr_method, interp_method, upsample_method,
-                ibp_iter, ibp_alpha, ibp_denoise, ibp_adaptive, ibp_dynamic, ibp_early
-            ],
-            outputs=[out_hr, out_lr, out_sr, out_mse, out_psnr],
+        sr_method.change(
+            toggle_sr,
+            inputs=[sr_method],
+            outputs=[interp_method, ibp_group]
         )
 
-        demo.launch()
+        # Run button
+        btn.click(
+            process_pipeline,
+            inputs=[inp, scale, sr_method, interp_method, upsample_method, ibp_iter, ibp_alpha],
+            outputs=[out_lr, out_sr]
+        )
+
+    demo.launch()
+
+if __name__ == "__main__":
+    run_gradio()

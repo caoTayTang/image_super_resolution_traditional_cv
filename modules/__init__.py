@@ -1,4 +1,4 @@
-from .degradation.degrade import degrade_image
+from .degrade import degrade_image
 
 # Tránh import các module nặng ở thời điểm import package để không gây circular import.
 def get_run_gradio():
