@@ -34,8 +34,6 @@ def compute_basic_metrics(img1, img2, multichannel=True):
         raise ValueError(f"Image shapes don't match: {img1.shape} vs {img2.shape}")
     
     metrics = {}
-    
-    # MSE
     metrics['MSE'] = mse(img1, img2)
     
     # PSNR (Giờ đây data_range luôn là 1.0 vì đã chuẩn hóa)

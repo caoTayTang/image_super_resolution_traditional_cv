@@ -1,10 +1,11 @@
+import numpy as np
 import cv2
 import numpy as np
 import gradio as gr
 from PIL import Image
 from src import sr_interpolation
+from src.Wiener_Filter import wiener_unsupervised_mcmc
 from src.ibp import iterative_backprojection
-
 
 # ======================
 # Helper Functions
@@ -55,7 +56,6 @@ def process_pipeline(
         sr = cv2.resize(lr, (new_W, new_H), interpolation=cv2_interp)
 
     elif sr_method == "Iterative Back-projection":
-        
         if lr.ndim == 3 and lr.shape[2] == 3: # Ảnh màu RGB
             channels = []
             for i in range(3):
@@ -80,6 +80,23 @@ def process_pipeline(
                 alpha=float(ibp_alpha)
             )
 
+
+    elif sr_method == "Wiener (unsupervised)":
+        upsampled = cv2.resize(lr, (new_W, new_H), interpolation=cv2.INTER_CUBIC)
+        upsampled = upsampled.astype(np.float32)
+        
+        if upsampled.ndim == 3 and upsampled.shape[2] == 3:
+            ycrcb = cv2.cvtColor(upsampled, cv2.COLOR_RGB2YCrCb)
+            ycrcb = ycrcb.astype(np.float32)
+            Y, Cr, Cb = cv2.split(ycrcb)
+            Y_restored = wiener_unsupervised_mcmc(Y)
+            Y_restored = np.clip(Y_restored, 0, 1)
+            Y_restored = Y_restored.astype(np.float32)
+            sr = cv2.cvtColor(cv2.merge([Y_restored, Cr, Cb]), cv2.COLOR_YCrCb2RGB)
+        else:
+            Y_restored = wiener_unsupervised_mcmc(upsampled)
+            sr = np.clip(Y_restored, 0, 1)
+ 
     sr_pil = np_to_pil(sr)
     lr_pil = np_to_pil(lr)
 
@@ -102,7 +119,7 @@ def run_gradio():
 
                 # SR method
                 sr_method = gr.Dropdown(
-                    ["Interpolation", "Iterative Back-projection"],
+                    ["Interpolation", "Iterative Back-projection", "Wiener (unsupervised)"],
                     value="Interpolation",
                     label="Super-Resolution Method"
                 )
@@ -135,8 +152,10 @@ def run_gradio():
         def toggle_sr(method):
             if method == "Iterative Back-projection":
                 return gr.update(visible=False), gr.update(visible=True)
-            else:
+            elif method == "Interpolation":
                 return gr.update(visible=True), gr.update(visible=False)
+            else:  # Wiener
+                return gr.update(visible=False), gr.update(visible=False)
 
         sr_method.change(
             toggle_sr,

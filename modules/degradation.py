@@ -8,28 +8,52 @@ def gaussian_kernel(size=9, sigma=1.6):
     return kernel / np.sum(kernel)
 
 def blur(image, kernel):
-    """Hỗ trợ ảnh màu và xám"""
+    """
+    Hàm làm mờ hỗ trợ cả ảnh xám và ảnh màu.
+    Dùng cv2.filter2D để thay thế vòng lặp for (nhanh hơn rất nhiều).
+    """
+    # cv2.filter2D tự động xử lý từng kênh màu nếu là ảnh màu
     return cv2.filter2D(image, -1, kernel, borderType=cv2.BORDER_REFLECT)
 
-def degrade_image(hr, scale, kernel=None, noise_std=0.0):
+def simulate_lr_from_hr(hr_est, scale, kernel):
+    """Mô phỏng LR từ HR: Blur + Downsample (làm thủ công)."""
+    # Bước 1: Blur
+    blurred = blur(hr_est, kernel)
+    # Bước 2: Downsample
+    lr = blurred[::scale, ::scale]
+
+    return lr
+
+def degrade_image(hr, scale=4, kernel=None, noise_type="gaussian", noise_std=0.01):
     if kernel is None:
         kernel = gaussian_kernel(9, 1.6)
-    
-    # 1. Blur
+
+    # Blur
     hr_blur = blur(hr, kernel)
-    
-    # 2. Downsample
+
+    # Downsample
     lr = hr_blur[::scale, ::scale]
-    
-    # 3. Add Noise
-    if noise_std > 0:
+
+    # Add noise
+    if noise_type == "gaussian":
         noise = np.random.normal(0, noise_std, lr.shape)
-        lr = lr + noise
-    
-    return np.clip(lr, 0.0, 1.0).astype(np.float32)
+    elif noise_type == "rayleigh":
+        noise = np.random.rayleigh(scale=noise_std, size=lr.shape)
+    elif noise_type == "gamma":
+        noise = np.random.gamma(shape=2.0, scale=noise_std, size=lr.shape)
+    elif noise_type == "exponential":
+        noise = np.random.exponential(scale=noise_std, size=lr.shape)
+    elif noise_type == "uniform":
+        noise = np.random.uniform(-noise_std, noise_std, size=lr.shape)
+    elif noise_type == "saltpepper":
+        prob = noise_std
+        noise = np.zeros_like(lr)
+        mask = np.random.rand(*lr.shape)
+        lr[mask < prob/2] = 0
+        lr[mask > 1 - prob/2] = 1
+        return lr
+    else:
+        noise = 0
 
-def simulate_lr_from_hr(hr_est, scale, kernel):
-    blurred = blur(hr_est, kernel)
-    return blurred[::scale, ::scale]
-
-
+    lr_noisy = np.clip(lr + noise, 0, 1)
+    return lr_noisy
