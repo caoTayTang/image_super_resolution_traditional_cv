@@ -1,6 +1,5 @@
 import numpy as np
-from modules.degradation import gaussian_kernel
-from modules.degradation import blur, simulate_lr_from_hr
+from modules.degradation import *
 from modules.upsample import upsample_bicubic
 
 def iterative_backprojection(
@@ -11,56 +10,26 @@ def iterative_backprojection(
     alpha=1.0,
     size=9,
     sigma=1.6,
-    kernel=None,
+    kernel=None
 ):
-    """
-    Iterative Back-Projection (IBP) with optional enhancements.
-    Parameters:
-    -----------
-    lr : np.ndarray
-        Low-resolution input image (normalized 0-1).
-    upsample : callable
-        Upsampling function (default: nearest).
-    scale : int
-        Scale factor between LR and HR.
-    iterations : int
-        Number of IBP iterations.
-    alpha : float
-        Step size (learning rate).
-    kernel : np.ndarray or None
-        Blur kernel. If None, Gaussian kernel is used.
-    size, sigma : int, float
-        Parameters for Gaussian kernel.
-
-    Returns:
-    --------
-    x : np.ndarray
-        The reconstructed HR image
-    """
-
-    # --- 1️⃣ Khởi tạo kernel ---
     if kernel is None:
         kernel = gaussian_kernel(size, sigma)
 
-    # --- 2️⃣ Khởi tạo ảnh HR nội suy ---
-    
     x = upsample(lr, scale)
+    flipped_kernel = np.flipud(np.fliplr(kernel))
 
-    # --- 3️⃣ Vòng lặp IBP ---
     for it in range(iterations):
         print(f"[IBP] Iteration {it+1}/{iterations}")
-        
-        # (a) Mô phỏng ảnh LR từ HR
+
         sim_lr = simulate_lr_from_hr(x, scale, kernel)
 
-        # (b) Tính sai số giữa LR thật và LR mô phỏng
         err_lr = lr - sim_lr
         err_up = upsample(err_lr, scale)
 
-        # (d) Back-projection: lật kernel để phản hồi sai số
         flipped_kernel = np.flipud(np.fliplr(kernel))
         backproj = blur(err_up, flipped_kernel)
 
         x = x + alpha * backproj
         x = np.clip(x, 0, 1)
+        
     return x
