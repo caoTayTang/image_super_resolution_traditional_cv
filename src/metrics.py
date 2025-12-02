@@ -5,40 +5,62 @@ from skimage.metrics import mean_squared_error as mse
 
 def ensure_float_0_1(img):
     """
-    Chuyển đổi ảnh sang float32 và chuẩn hóa về [0, 1] bất kể đầu vào là gì
+    Chuyển đổi ảnh sang float32 và chuẩn hóa về [0, 1]
     """
     img = np.array(img).astype(np.float32)
     
-    # Nếu giá trị lớn nhất > 1.0, ta đoán nó là ảnh 0-255 -> Chia 255
-    if img.max() > 1.0001: 
+    # Nếu ảnh đang là 0-255 (hoặc lớn hơn 1), chia cho 255
+    if img.max() > 1.0:
         img = img / 255.0
         
-    # Clip chặt lại [0, 1]
+    # Clip chặt lại để đảm bảo không có số nào < 0 hoặc > 1 do lỗi làm tròn
     img = np.clip(img, 0.0, 1.0)
     return img
 
 def compute_basic_metrics(img1, img2, multichannel=True):
-    # --- DEBUG: In ra để kiểm tra xem có bị lệch thang đo không ---
-    # print(f"Max img1: {img1.max()}, Max img2: {img2.max()}") 
-    
+    """
+    Tính các chỉ số đánh giá chất lượng ảnh (PSNR, SSIM, MSE)
+    Args:
+        img1, img2: Ảnh đầu vào (sẽ tự động được convert về float [0,1])
+        multichannel: True nếu là ảnh màu
+    """
     # 1. Chuẩn hóa cả 2 ảnh về cùng kiểu float [0,1]
     img1 = ensure_float_0_1(img1)
     img2 = ensure_float_0_1(img2)
     
+    # Ensure images have same shape
+    if img1.shape != img2.shape:
+        # Thử resize img1 về img2 nếu cần thiết (tùy chọn), hoặc báo lỗi
+        raise ValueError(f"Image shapes don't match: {img1.shape} vs {img2.shape}")
+    
     metrics = {}
     metrics['MSE'] = mse(img1, img2)
     
-    # data_range=1.0 là cực kỳ quan trọng vì ta đã chuẩn hóa ở trên
+    # PSNR (Giờ đây data_range luôn là 1.0 vì đã chuẩn hóa)
     metrics['PSNR'] = psnr(img1, img2, data_range=1.0)
     
-    # Tính SSIM
+    # SSIM logic (giữ nguyên logic cửa sổ tốt của bạn)
     min_dim = min(img1.shape[0], img1.shape[1])
-    win_size = min(7, min_dim if min_dim % 2 != 0 else min_dim - 1)
+    
+    if min_dim >= 11: win_size = 11
+    elif min_dim >= 7: win_size = 7
+    elif min_dim >= 5: win_size = 5
+    else: win_size = 3
+    
+    if win_size % 2 == 0: win_size -= 1
     
     try:
-        channel_axis = 2 if (img1.ndim == 3) else None
-        metrics['SSIM'] = ssim(img1, img2, win_size=win_size, channel_axis=channel_axis, data_range=1.0)
-    except:
+        # Kiểm tra xem ảnh có kênh màu hay không (ndim=3)
+        channel_axis = 2 if (img1.ndim == 3 and multichannel) else None
+        
+        metrics['SSIM'] = ssim(
+            img1, img2, 
+            win_size=win_size,
+            channel_axis=channel_axis,
+            data_range=1.0
+        )
+    except Exception as e:
+        print(f"Warning: SSIM calculation failed: {e}")
         metrics['SSIM'] = 0.0
     
     return metrics

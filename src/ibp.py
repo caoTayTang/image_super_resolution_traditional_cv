@@ -1,6 +1,5 @@
 import numpy as np
-from modules.degradation import gaussian_kernel
-from modules.degradation import blur, simulate_lr_from_hr
+from modules.degradation import *
 from modules.upsample import upsample_bicubic
 
 def iterative_backprojection(
@@ -11,7 +10,7 @@ def iterative_backprojection(
     alpha=1.0,
     size=9,
     sigma=1.6,
-    kernel=None,
+    kernel=None
 ):
     """
     Iterative Back-Projection (IBP) with optional enhancements.
@@ -59,4 +58,5 @@ def iterative_backprojection(
 
         x = x + alpha * backproj
         x = np.clip(x, 0, 1)
+        
     return x
