@@ -1,24 +1,15 @@
-import numpy as np
 import cv2
-from PIL import Image
+import numpy as np
 import gradio as gr
-
-# Giả sử bạn đã có file này
-# from src import sr_interpolation
+from PIL import Image
+from src import sr_interpolation
 from src.ibp import iterative_backprojection
 
-# Vì mình không có file src của bạn, mình tạo hàm dummy để code chạy được demo
-# Bạn nhớ xóa 2 hàm dummy này khi chạy thật nhé
-if 'sr_interpolation' not in globals():
-    def sr_interpolation(lr, scale, method):
-        h, w = lr.shape[:2]
-        return cv2.resize(lr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
 
 # ======================
 # Helper Functions
 # ======================
 def pil_to_np(img: Image.Image):
-    # SỬA: Không convert("L") nữa. 
     # Nếu là ảnh màu, giữ nguyên RGB. Nếu là ảnh xám, convert sang RGB để xử lý thống nhất hoặc giữ nguyên tùy logic.
     # Ở đây ta convert sang RGB để đảm bảo đầu ra luôn có 3 kênh nếu là ảnh màu.
     if img.mode != 'RGB':
@@ -54,13 +45,6 @@ def process_pipeline(
     # Super-Resolution
     # ----------------------
     if sr_method == "Interpolation":
-        # Các hàm interpolation của OpenCV (dùng trong sr_interpolation giả định) 
-        # tự động xử lý được cả ảnh màu và ảnh xám
-        
-        # Lưu ý: Cần đảm bảo sr_interpolation của bạn dùng cv2.resize hoặc tương tự hỗ trợ đa kênh
-        # Nếu hàm sr_interpolation của bạn tự viết tay chỉ hỗ trợ 2D, bạn cũng cần tách kênh như IBP bên dưới
-        
-        # Mapping method string sang cv2 constant
         cv2_interp = {
             "nearest": cv2.INTER_NEAREST,
             "bilinear": cv2.INTER_LINEAR,
@@ -71,8 +55,6 @@ def process_pipeline(
         sr = cv2.resize(lr, (new_W, new_H), interpolation=cv2_interp)
 
     elif sr_method == "Iterative Back-projection":
-        # IBP thường được viết cho ma trận 2D. 
-        # Để xử lý ảnh màu, ta tách kênh (Split) -> Xử lý -> Gộp kênh (Merge)
         
         if lr.ndim == 3 and lr.shape[2] == 3: # Ảnh màu RGB
             channels = []
@@ -97,16 +79,6 @@ def process_pipeline(
                 iterations=int(ibp_iter),
                 alpha=float(ibp_alpha)
             )
-
-        # Resize lại lần cuối nếu cần (để khớp kích thước output mong muốn hoặc làm mượt)
-        # Lưu ý: cv2.resize hỗ trợ tốt ảnh màu (H, W, 3)
-        cv2_upsample = {
-            "nearest": cv2.INTER_NEAREST,
-            "bilinear": cv2.INTER_LINEAR,
-            "bicubic": cv2.INTER_CUBIC
-        }[upsample_method]
-        
-        sr = cv2.resize(sr, (new_W, new_H), interpolation=cv2_upsample)
 
     sr_pil = np_to_pil(sr)
     lr_pil = np_to_pil(lr)
