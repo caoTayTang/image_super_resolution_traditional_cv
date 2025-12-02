@@ -38,26 +38,22 @@ def iterative_backprojection(
         The reconstructed HR image
     """
 
-    # --- 1️⃣ Khởi tạo kernel ---
+    # Khởi tạo kernel ---
     if kernel is None:
         kernel = gaussian_kernel(size, sigma)
 
-    # --- 2️⃣ Khởi tạo ảnh HR nội suy ---
-    
+    # Khởi tạo ảnh HR nội suy ---
     x = upsample(lr, scale)
 
-    # --- 3️⃣ Vòng lặp IBP ---
+    # Vòng lặp IBP ---
     for it in range(iterations):
         print(f"[IBP] Iteration {it+1}/{iterations}")
         
-        # (a) Mô phỏng ảnh LR từ HR
         sim_lr = simulate_lr_from_hr(x, scale, kernel)
-
-        # (b) Tính sai số giữa LR thật và LR mô phỏng
+        
         err_lr = lr - sim_lr
         err_up = upsample(err_lr, scale)
 
-        # (d) Back-projection: lật kernel để phản hồi sai số
         flipped_kernel = np.flipud(np.fliplr(kernel))
         backproj = blur(err_up, flipped_kernel)
 
